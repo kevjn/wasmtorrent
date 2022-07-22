@@ -13,7 +13,7 @@ use sha1::{Sha1, Digest};
 use serde_bencode::de;
 use serde_bytes::ByteBuf;
 use std::{time::Duration, net::{TcpStream, IpAddr, SocketAddr}, sync::{Arc, Mutex}};
-use std::io::{Read, Write, Error as IoError, ErrorKind, Seek, SeekFrom, Result as IoResult};
+use std::io::{Read, Write, Seek, SeekFrom, Result as IoResult};
 
 use reqwest::Url;
 use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
@@ -27,6 +27,16 @@ extern crate lazy_static;
 
 #[macro_use] 
 extern crate log;
+
+// https://github.com/rust-webplatform/rust-todomvc/blob/51cbd62e906a6274d951fd7a8f5a6c33fcf8e7ea/src/main.rs#L34-L41
+macro_rules! enclose {
+    ( ($( $x:ident ),*) $y:expr ) => {
+        {
+            $(let $x = $x.clone();)*
+            $y
+        }
+    };
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct BencodeInfo {
@@ -127,13 +137,12 @@ impl Torrent {
         // fill work queue
         for (i, piece) in self.pieces.iter().enumerate() {
             let begin = (i as i64) * self.piece_length;
-            let end = std::cmp::min(begin + self.piece_length, self.length);
-            let piece_size = end - begin;
+            let piecesize = (begin+self.piece_length).min(self.length) - begin;
 
             tx.send(PieceWork {
                 index: i,
                 hash: *piece,
-                length: piece_size as u32,
+                length: piecesize as u32,
             }).unwrap();
         }
 
@@ -153,12 +162,8 @@ impl Torrent {
             let ip: [u8; 4] = x[0..4].try_into().unwrap();
             let peer = SocketAddr::new(IpAddr::from(ip), BigEndian::read_u16(&x[4..]));
 
-            let tx = tx.clone();
-            let tx_result= tx_result.clone();
-            let rx = rx.clone();
-            let num_peers = num_peers.clone();
             *num_peers.lock().unwrap() += 1;
-            std::thread::spawn(move || {
+            std::thread::spawn(enclose! { (tx, rx, tx_result, num_peers) move || {
                 match start_download_worker(peer, tx, rx, tx_result, &self.info_hash) {
                     Ok(()) => info!("success"),
                     Err(error) => {
@@ -166,7 +171,7 @@ impl Torrent {
                         info!("Disconnecting from {:?} with error ({:?})", peer, error);
                     }
                 }
-            });
+            } });
         });
 
         // collect results
@@ -249,27 +254,6 @@ struct Message {
     payload: Vec<u8>,
 }
 
-#[derive(Debug)]
-struct ReadMessageError {
-    message: String,
-}
-
-impl std::error::Error for ReadMessageError {}
-
-impl std::fmt::Display for ReadMessageError {
-  fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-     write!(f, "{}", self.message)
-  }
-}
-
-impl From<IoError> for ReadMessageError {
-    fn from(error: IoError) -> Self {
-        ReadMessageError {
-            message: error.to_string(),
-        }
-    }
-}
-
 impl Message {
     fn serialize<W: Write>(&self, writer: &mut W) -> IoResult<()>
     {
@@ -299,18 +283,6 @@ impl Message {
             })
         )
     }
-
-    fn format_request(index: u32, begin: u32, length: u32) -> Message {
-        Message {
-            id: MessageId::Request,
-            payload: [
-                index.to_be_bytes(),
-                begin.to_be_bytes(),
-                length.to_be_bytes(),
-            ].concat()
-        }
-    }
-
 }
 
 struct Client {
@@ -320,13 +292,12 @@ struct Client {
 }
 
 impl Client {
-    fn new(peer: SocketAddr, info_hash: &[u8; 20]) -> Result<Client, Box<dyn std::error::Error>> {
-        // create tcp conn with peer
+    fn new(peer: SocketAddr, info_hash: &[u8; 20]) -> bincode::Result<Client> {
+        // create tcp connection with peer
         let mut conn = TcpStream::connect_timeout(&peer, Duration::from_secs(3))?;
 
         // use u8 as length encoding
-        let opt = DefaultOptions::new()
-            .with_varint_encoding();
+        let opt = DefaultOptions::new().with_varint_encoding();
 
         // send handshake
         let req = Handshake::new(info_hash);
@@ -337,46 +308,29 @@ impl Client {
 
         // verify infohash
         if res.info_hash != *info_hash {
-            return Err(Box::new(IoError::new(ErrorKind::InvalidData, "invalid info hash")))
+            return Err(bincode::ErrorKind::Custom("invalid info hash".to_string()).into());
         }
 
         // recieve bitfield
-        let req = Message::read(&mut conn)?.unwrap();
-        if req.id != MessageId::Bitfield {
-            let msg = format!("Expected bitfield but got {:?}", req.id);
-            return Err(Box::new(IoError::new(ErrorKind::InvalidData, msg)))
+        let res = Message::read(&mut conn)?.unwrap();
+        if res.id != MessageId::Bitfield {
+            let error_message = format!("Expected bitfield but got {:?}", res.id);
+            return Err(bincode::ErrorKind::Custom(error_message).into());
         }
 
         Ok(Client {
             conn,
             choked: true,
-            bitfield: BitVec::from_bytes(&req.payload),
+            bitfield: BitVec::from_bytes(&res.payload),
         })
 
     }
 
-    fn send_unchoke(&mut self) {
-        let msg = Message {
-            id: MessageId::Unchoke,
-            payload: vec![],
-        };
-
-        msg.serialize(&mut self.conn).unwrap();
-    }
-
-    fn send_interested(&mut self) {
-        let msg = Message {
-            id: MessageId::Interested,
-            payload: vec![],
-        };
-
-        msg.serialize(&mut self.conn).unwrap();
-    }
-
-    fn send_request(&mut self, index: usize, begin: u32, length: u32) -> Result<(), std::io::Error>{
-        let msg = Message::format_request(index as u32, begin, length);
-        msg.serialize(&mut self.conn)?;
-        Ok(())
+    fn send_message(&mut self, id: MessageId, payload: Option<Vec<u8>>) -> IoResult<()> {
+        Message {
+            id,
+            payload: payload.unwrap_or_default()
+        }.serialize(&mut self.conn)
     }
 
 }
@@ -391,8 +345,8 @@ fn start_download_worker(
 
     let mut client = Client::new(peer, info_hash)?;
 
-    client.send_unchoke();
-    client.send_interested();
+    client.send_message(MessageId::Unchoke, None)?;
+    client.send_message(MessageId::Interested, None)?;
 
     for pw in rx {
         if !client.bitfield[pw.index] {
@@ -405,32 +359,27 @@ fn start_download_worker(
             Ok(buf) => buf,
             Err(error) => {
                 tx.send(pw).unwrap();
-                warn!("Failed to download piece {:?}, Exiting", error);
+                error!("Failed to download piece {:?}, Exiting", error);
                 return Err(error);
             }
         };
-
+        
         // check integrity of the piece
-        let mut hasher = Sha1::new();
-        hasher.update(&buf);
-        let hash: [u8; 20] = hasher.finalize().into();
+        let hash: [u8; 20] = Sha1::digest(&buf).into();
         if hash != pw.hash {
             tx.send(pw).unwrap();
-            warn!("hashes do not match");
+            error!("hashes do not match");
             continue;
         }
 
         // notify peer that we have the piece
-        Message {
-            id: MessageId::Have,
-            payload: (pw.index as u32).to_be_bytes().to_vec(),
-        }.serialize(&mut client.conn).unwrap();
+        client.send_message(MessageId::Have, Some((pw.index as u32).to_be_bytes().to_vec()))?;
         
         // add piece to result
         tx_result.send(PieceResult {
             buf,
             index: pw.index,
-        }).unwrap();
+        })?;
     }
     Ok(())
 
@@ -442,8 +391,8 @@ fn attempt_download_piece(client: &mut Client, pw: &PieceWork) -> Result<Vec<u8>
     client.conn.set_read_timeout(Some(Duration::from_secs(30)))?;
     client.conn.set_write_timeout(Some(Duration::from_secs(30)))?;
 
-    let max_backlog = 5;
-    let max_blocksize = 16384;
+    const MAX_BACKLOG: i32 = 5;
+    const MAX_BLOCKSIZE: u32 = 16384;
 
     let mut downloaded = 0;
     let mut backlog = 0;
@@ -454,15 +403,15 @@ fn attempt_download_piece(client: &mut Client, pw: &PieceWork) -> Result<Vec<u8>
     while downloaded < pw.length {
         if !client.choked {
             // if unchoked, send requests untill we have enough unfulfilled requests
-            while backlog < max_backlog && requested < pw.length {
-                let mut blocksize = max_blocksize;
+            while backlog < MAX_BACKLOG && requested < pw.length {
+                // Last block might be shorter than the max blocksize
+                let blocksize = std::cmp::min(pw.length, requested+MAX_BLOCKSIZE) - requested;
 
-                // Last block might be shorter than the typical block
-                if pw.length - requested < blocksize {
-                    blocksize = pw.length - requested
-                }
-
-                client.send_request(pw.index, requested, blocksize)?;
+                client.send_message(MessageId::Request, Some([
+                    (pw.index as u32).to_be_bytes(), 
+                    requested.to_be_bytes(), 
+                    blocksize.to_be_bytes()
+                ].concat()))?;
 
                 backlog += 1;
                 requested += blocksize;
@@ -491,16 +440,15 @@ fn attempt_download_piece(client: &mut Client, pw: &PieceWork) -> Result<Vec<u8>
                 let index = u32::from_be_bytes(msg.payload[..4].try_into().unwrap());
                 // compare both index
                 if index as usize != pw.index {
-                    return Err(Box::new(IoError::new(ErrorKind::InvalidData, "Wrong index")));
+                    return Err(format!("Expected index {}, got {}", index, pw.index).into());
                 }
-
                 let begin = u32::from_be_bytes(msg.payload[4..8].try_into().unwrap()) as usize;
                 if begin > buf.len() {
-                    return Err(Box::new(IoError::new(ErrorKind::InvalidData, "Begin offset to high")));
+                    return Err("Begin offset to high".into());
                 }
                 let data = &msg.payload[8..];
                 if begin + data.len() > buf.len() {
-                    return Err(Box::new(IoError::new(ErrorKind::InvalidData, "Data too long")));
+                    return Err("Data too long".into());
                 }
                 buf[begin..begin+data.len()].clone_from_slice(data);
                 downloaded += data.len() as u32;
@@ -567,7 +515,7 @@ mod tests {
         }
 
         // store the result in a multi-producer, single-consumer queue
-        let (tx_result, _) = std::sync::mpsc::channel::<PieceResult>();
+        let (tx_result, rx_result) = std::sync::mpsc::channel::<PieceResult>();
 
         match start_download_worker(peer, tx, rx, tx_result, &torrent.info_hash) {
             Ok(()) => info!("success"),
@@ -632,19 +580,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(encoded, [19, 66, 105, 116, 84, 111, 114, 114, 101, 110, 116, 32, 112, 114, 111, 116, 111, 99, 111, 108, 0, 0, 0, 0, 0, 0, 0, 0, 134, 212, 200, 0, 36, 164, 105, 190, 76, 80, 188, 90, 16, 44, 247, 23, 128, 49, 0, 116, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
-    }
-
-    #[test]
-    fn test_format_request() {
-        let msg = Message::format_request(4, 567, 4321);
-        assert_eq!(msg, Message {
-            id: MessageId::Request,
-            payload: vec![
-                0x00, 0x00, 0x00, 0x04, // Index
-                0x00, 0x00, 0x02, 0x37, // Begin
-			    0x00, 0x00, 0x10, 0xe1, // Length
-            ]
-        });
     }
 
     #[test]
