@@ -16,7 +16,6 @@ use serde_bytes::ByteBuf;
 use std::{time::Duration, net::{TcpStream, IpAddr, SocketAddr}, sync::{Arc, Mutex}, fs::OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom, Result as IoResult};
 
-use reqwest::Url;
 use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
 use rand::Rng;
 use byteorder::{ByteOrder, BigEndian, WriteBytesExt, ReadBytesExt};
@@ -93,17 +92,10 @@ impl<'de> serde::Deserialize<'de> for Torrent {
 
 fn build_query_string<'a, I>(pairs: I) -> String 
 where I: IntoIterator<Item = (&'a str, &'a str)> {
-    use std::fmt::Write as _;
-
-    let mut query = String::new();
-    let mut iter = pairs.into_iter();
-    if let Some((first_key, first_value)) = iter.next() {
-        let _ = write!(query, "{}={}", first_key, first_value);
-        iter.for_each(|(key, value)| {
-            let _ = write!(query, "&{}={}", key, value);
-        });
-    }
-    query
+    pairs.into_iter()
+        .map(|(key, value)| format!("{}={}", key, value))
+        .collect::<Vec<String>>()
+        .join("&")
 }
 
 impl Torrent {
@@ -113,8 +105,7 @@ impl Torrent {
         let info_hash = percent_encode(&self.info_hash, NON_ALPHANUMERIC);
         let peer_id = percent_encode(peer_id, NON_ALPHANUMERIC);
 
-        let mut url = Url::parse(&self.announce).unwrap();
-        url.set_query(Some(&build_query_string([
+        let query = build_query_string([
             ("compact", "1"),
             ("downloaded", "0"),
             ("info_hash", &info_hash.to_string()),
@@ -122,8 +113,9 @@ impl Torrent {
             ("peer_id", &peer_id.to_string()),
             ("port", &port.to_string()),
             ("uploaded", "0"),
-        ])));
-        url.to_string()
+        ]);
+
+        format!("{}?{}", self.announce, query)
     }
 
     fn start<F: Read + Write + Seek>(self, file: &mut F) -> IoResult<()> {
