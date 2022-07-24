@@ -1,5 +1,7 @@
 #![feature(slice_as_chunks)]
 #![feature(array_chunks)]
+#![feature(iterator_try_collect)]
+#![feature(split_array)]
 
 extern crate serde;
 extern crate serde_bencode;
@@ -7,7 +9,6 @@ extern crate serde_bencode;
 extern crate serde_derive;
 extern crate serde_bytes;
 
-use bincode::{DefaultOptions, Options};
 use bit_vec::BitVec;
 use sha1::{Sha1, Digest};
 use serde_bencode::de;
@@ -20,7 +21,6 @@ use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
 use rand::Rng;
 use byteorder::{ByteOrder, BigEndian, WriteBytesExt, ReadBytesExt};
 use crossbeam_channel::{bounded, Sender, Receiver};
-use num_enum::{TryFromPrimitive, IntoPrimitive};
 
 #[macro_use]
 extern crate lazy_static;
@@ -60,9 +60,9 @@ struct BencodeTorrent {
 struct Torrent {
     announce: String,
     info_hash: [u8; 20],
-    pieces: Box<[[u8; 20]]>,
-    piece_length: i64,
-    length: i64,
+    pieces: Vec<[u8; 20]>,
+    piece_len: i64,
+    file_len: i64,
     name: String,
 }
 
@@ -70,14 +70,12 @@ impl<'de> serde::Deserialize<'de> for Torrent {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::de::Deserializer<'de>,
-    {
+        {
         let torrent: BencodeTorrent = serde::Deserialize::deserialize(deserializer)?;
 
         // calculate sha1 hash for Torrent info
         let bytes = serde_bencode::ser::to_bytes(&torrent.info).unwrap();
-        let mut hasher = Sha1::new();
-        hasher.update(&bytes);
-        let info_hash = hasher.finalize().into();
+        let info_hash = Sha1::digest(bytes).into();
 
         // split pieces into slice of hashes where each slice is 20 bytes
         let pieces: &[[u8; 20]] = torrent.info.pieces.as_chunks().0;
@@ -86,8 +84,8 @@ impl<'de> serde::Deserialize<'de> for Torrent {
             announce: torrent.announce.unwrap(),
             info_hash,
             pieces: pieces.into(),
-            piece_length: torrent.info.piece_length,
-            length: torrent.info.length.unwrap(),
+            piece_len: torrent.info.piece_length,
+            file_len: torrent.info.length.unwrap(),
             name: torrent.info.name,
         })
     }
@@ -120,7 +118,7 @@ impl Torrent {
             ("compact", "1"),
             ("downloaded", "0"),
             ("info_hash", &info_hash.to_string()),
-            ("left", &self.length.to_string()),
+            ("left", &self.file_len.to_string()),
             ("peer_id", &peer_id.to_string()),
             ("port", &port.to_string()),
             ("uploaded", "0"),
@@ -128,7 +126,7 @@ impl Torrent {
         url.to_string()
     }
 
-    fn download<W: Write + Seek>(self, writer: &mut W) -> IoResult<()> {
+    fn start<W: Write + Seek>(self, writer: &mut W) -> IoResult<()> {
         info!("Starting download for {}", self.name);
 
         // create a multi-producer, multi-consumer queue with specified capacity
@@ -136,8 +134,8 @@ impl Torrent {
 
         // fill work queue
         for (i, piece) in self.pieces.iter().enumerate() {
-            let begin = (i as i64) * self.piece_length;
-            let piecesize = (begin+self.piece_length).min(self.length) - begin;
+            let begin = (i as i64) * self.piece_len;
+            let piecesize = (begin+self.piece_len).min(self.file_len) - begin;
 
             tx.send(PieceWork {
                 index: i,
@@ -151,7 +149,7 @@ impl Torrent {
         
         // identifies the file we want to download
         let tracker_url = self.build_tracker_url(&RANDOM_ID, 6882);
-
+        // announce our presence to the tracker
         let bytes = reqwest::blocking::get(tracker_url).unwrap().bytes().unwrap();
         let response: BencodeTrackerResp = de::from_bytes(&bytes).unwrap();
 
@@ -159,12 +157,12 @@ impl Torrent {
         let num_peers = Arc::new(Mutex::new(0));
 
         response.peers.array_chunks().for_each(|x: &[u8; 6]| {
-            let ip: [u8; 4] = x[0..4].try_into().unwrap();
-            let peer = SocketAddr::new(IpAddr::from(ip), BigEndian::read_u16(&x[4..]));
+            let (ip, port) = x.split_array_ref::<4>();
+            let peer = SocketAddr::new(IpAddr::from(*ip), BigEndian::read_u16(port));
 
             *num_peers.lock().unwrap() += 1;
             std::thread::spawn(enclose! { (tx, rx, tx_result, num_peers) move || {
-                match start_download_worker(peer, tx, rx, tx_result, &self.info_hash) {
+                match spawn_connector_task(peer, tx, rx, tx_result, &self.info_hash) {
                     Ok(()) => info!("success"),
                     Err(error) => {
                         *num_peers.lock().unwrap() -= 1;
@@ -174,11 +172,11 @@ impl Torrent {
             } });
         });
 
-        // collect results
+        // collect download results
         let mut done_pieces = 0;
         while done_pieces < self.pieces.len() {
             let res = rx_result.recv().unwrap();
-            let begin = (res.index as i64) * self.piece_length;
+            let begin = (res.index as i64) * self.piece_len;
             writer.seek(SeekFrom::Start(begin as u64))?;
             writer.write_all(&res.buf)?;
             done_pieces += 1;
@@ -208,8 +206,9 @@ struct BencodeTrackerResp {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Handshake {
-    pstr: String,           // protocol identifier
-    reserved: [u8; 8],      // 8 reserved bytes
+    len: u8,
+    protocol: [u8; 19],
+    reserved: [u8; 8],
     info_hash: [u8; 20],
     peer_id: [u8; 20],
 }
@@ -226,8 +225,9 @@ lazy_static! {
 
 impl Handshake {
     fn new(info_hash: &[u8; 20]) -> Handshake {
-        Handshake { 
-            pstr: "BitTorrent protocol".to_string(), 
+        Handshake {
+            len: 19,
+            protocol: b"BitTorrent protocol".to_owned(),
             reserved: [0u8; 8],
             info_hash: *info_hash, 
             peer_id: *RANDOM_ID,
@@ -235,22 +235,21 @@ impl Handshake {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, TryFromPrimitive, IntoPrimitive)] #[repr(u8)]
-enum MessageId {
-    Choke,
-    Unchoke,
-    Interested,
-    NotInterested,
-    Have,
-    Bitfield,       // bitfield represents the pieces that a peer has
-    Request,
-    Piece,
-    Cancel,
+mod btid {
+    pub const CHOKE: u8 = 0;
+    pub const UNCHOKE: u8 = 1;
+    pub const INTEREST: u8 = 2;
+    pub const UNINTEREST: u8 = 3;
+    pub const HAVE: u8 = 4;
+    pub const BITFIELD: u8 = 5;
+    pub const REQUEST: u8 = 6;
+    pub const PIECE: u8 = 7;
+    pub const CANCEL: u8 = 8;
 }
 
 #[derive(Debug, PartialEq)]
 struct Message {
-    id: MessageId,
+    id: u8,
     payload: Vec<u8>,
 }
 
@@ -258,7 +257,7 @@ impl Message {
     fn serialize<W: Write>(&self, writer: &mut W) -> IoResult<()>
     {
         writer.write_u32::<BigEndian>((self.payload.len() + 1) as u32)?;
-        writer.write_u8(self.id.into())?;
+        writer.write_u8(self.id)?;
         writer.write_all(&self.payload)?;
 
         Ok(())
@@ -278,7 +277,7 @@ impl Message {
 
         Ok(
             Some(Message {
-                id: buf[0].try_into().unwrap(),
+                id: buf[0],
                 payload: buf[1..].to_vec(),
             })
         )
@@ -296,15 +295,12 @@ impl Client {
         // create tcp connection with peer
         let mut conn = TcpStream::connect_timeout(&peer, Duration::from_secs(3))?;
 
-        // use u8 as length encoding
-        let opt = DefaultOptions::new().with_varint_encoding();
-
         // send handshake
         let req = Handshake::new(info_hash);
-        opt.serialize_into(&conn, &req)?;
+        bincode::serialize_into(&conn, &req)?;
 
         // recieve handshake
-        let res: Handshake = opt.deserialize_from(&conn)?;
+        let res: Handshake = bincode::deserialize_from(&conn)?;
 
         // verify infohash
         if res.info_hash != *info_hash {
@@ -313,7 +309,7 @@ impl Client {
 
         // recieve bitfield
         let res = Message::read(&mut conn)?.unwrap();
-        if res.id != MessageId::Bitfield {
+        if res.id != btid::BITFIELD {
             let error_message = format!("Expected bitfield but got {:?}", res.id);
             return Err(bincode::ErrorKind::Custom(error_message).into());
         }
@@ -326,7 +322,7 @@ impl Client {
 
     }
 
-    fn send_message(&mut self, id: MessageId, payload: Option<Vec<u8>>) -> IoResult<()> {
+    fn send_message(&mut self, id: u8, payload: Option<Vec<u8>>) -> IoResult<()> {
         Message {
             id,
             payload: payload.unwrap_or_default()
@@ -335,7 +331,7 @@ impl Client {
 
 }
 
-fn start_download_worker(
+fn spawn_connector_task(
     peer: SocketAddr, 
     tx: Sender<PieceWork>, 
     rx: Receiver<PieceWork>, 
@@ -345,8 +341,8 @@ fn start_download_worker(
 
     let mut client = Client::new(peer, info_hash)?;
 
-    client.send_message(MessageId::Unchoke, None)?;
-    client.send_message(MessageId::Interested, None)?;
+    client.send_message(btid::UNCHOKE, None)?;
+    client.send_message(btid::INTEREST, None)?;
 
     for pw in rx {
         if !client.bitfield[pw.index] {
@@ -373,7 +369,7 @@ fn start_download_worker(
         }
 
         // notify peer that we have the piece
-        client.send_message(MessageId::Have, Some((pw.index as u32).to_be_bytes().to_vec()))?;
+        client.send_message(btid::HAVE, Some((pw.index as u32).to_be_bytes().to_vec()))?;
         
         // add piece to result
         tx_result.send(PieceResult {
@@ -386,11 +382,6 @@ fn start_download_worker(
 }
 
 fn attempt_download_piece(client: &mut Client, pw: &PieceWork) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-
-    // set deadline for reading/writing to tcp connection to 30 seconds
-    client.conn.set_read_timeout(Some(Duration::from_secs(30)))?;
-    client.conn.set_write_timeout(Some(Duration::from_secs(30)))?;
-
     const MAX_BACKLOG: i32 = 5;
     const MAX_BLOCKSIZE: u32 = 16384;
 
@@ -405,9 +396,9 @@ fn attempt_download_piece(client: &mut Client, pw: &PieceWork) -> Result<Vec<u8>
             // if unchoked, send requests untill we have enough unfulfilled requests
             while backlog < MAX_BACKLOG && requested < pw.length {
                 // Last block might be shorter than the max blocksize
-                let blocksize = std::cmp::min(pw.length, requested+MAX_BLOCKSIZE) - requested;
+                let blocksize = pw.length.min(requested+MAX_BLOCKSIZE) - requested;
 
-                client.send_message(MessageId::Request, Some([
+                client.send_message(btid::REQUEST, Some([
                     (pw.index as u32).to_be_bytes(), 
                     requested.to_be_bytes(), 
                     blocksize.to_be_bytes()
@@ -426,17 +417,17 @@ fn attempt_download_piece(client: &mut Client, pw: &PieceWork) -> Result<Vec<u8>
         }
         let msg = msg.unwrap();
         match msg.id {
-            MessageId::Choke => { 
+            btid::CHOKE => { 
                 client.choked = true; 
             },
-            MessageId::Unchoke => { 
+            btid::UNCHOKE => { 
                 client.choked = false; 
             },
-            MessageId::Have => {
+            btid::HAVE => {
                 let index = u32::from_be_bytes(msg.payload.try_into().unwrap());
                 client.bitfield.set(index as usize, true);
             },
-            MessageId::Piece => {
+            btid::PIECE => {
                 let index = u32::from_be_bytes(msg.payload[..4].try_into().unwrap());
                 // compare both index
                 if index as usize != pw.index {
@@ -468,15 +459,13 @@ fn main() -> IoResult<()> {
         .without_time()
         .init();
 
-    // TODO: read from stdin
-    let mut f = std::fs::File::open("./testdata/debian-11.4.0-amd64-netinst.iso.torrent")?;
-    let mut buffer = Vec::new();
-    f.read_to_end(&mut buffer)?;
+    let args = std::env::args().collect::<Vec<String>>();
+    let filename = args.get(1).expect("no torrent file specified");
+    let bytes = std::fs::read(filename)?;
 
-    let torrent = de::from_bytes::<Torrent>(&buffer).unwrap();
-
-    let mut f = std::fs::File::create("foo.txt")?;
-    torrent.download(&mut f).unwrap();
+    let torrent = de::from_bytes::<Torrent>(&bytes).unwrap();
+    let mut f = std::fs::File::create(&torrent.name)?;
+    torrent.start(&mut f)?;
 
     Ok(())
 }
@@ -503,8 +492,8 @@ mod tests {
         // fill work queue
         let (tx, rx) = bounded::<PieceWork>(torrent.pieces.len());
         for (i, piece) in torrent.pieces.iter().enumerate() {
-            let begin = (i as i64) * torrent.piece_length;
-            let end = std::cmp::min(begin + torrent.piece_length, torrent.length);
+            let begin = (i as i64) * torrent.piece_len;
+            let end = std::cmp::min(begin + torrent.piece_len, torrent.file_len);
             let piece_size = end - begin;
 
             tx.send(PieceWork {
@@ -517,7 +506,7 @@ mod tests {
         // store the result in a multi-producer, single-consumer queue
         let (tx_result, rx_result) = std::sync::mpsc::channel::<PieceResult>();
 
-        match start_download_worker(peer, tx, rx, tx_result, &torrent.info_hash) {
+        match spawn_connector_task(peer, tx, rx, tx_result, &torrent.info_hash) {
             Ok(()) => info!("success"),
             Err(error) => info!("Disconnecting from {:?} with error ({:?})", peer, error),
         }
@@ -529,12 +518,12 @@ mod tests {
         let to = Torrent {
             announce: "http://bttracker.debian.org:6969/announce".to_string(),
             info_hash: [216, 247, 57, 206, 195, 40, 149, 108, 204, 91, 191, 31, 134, 217, 253, 207, 219, 168, 206, 182],
-            pieces: Box::new([
+            pieces: [
                 [49, 50, 51, 52, 53, 54, 55, 56, 57, 48, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106],
                 [97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 49, 50, 51, 52, 53, 54, 55, 56, 57, 48]
-            ]),
-            piece_length: 262144,
-            length: 351272960,
+            ].into(),
+            piece_len: 262144,
+            file_len: 351272960,
             name: "debian-10.2.0-amd64-netinst.iso".to_string(),
         };
 
@@ -568,16 +557,14 @@ mod tests {
     #[test]
     fn test_handshake() {
         let handshake = Handshake {
-            pstr: "BitTorrent protocol".to_string(),
+            len: 19,
+            protocol: b"BitTorrent protocol".to_owned(),
             reserved: [0, 0, 0, 0, 0, 0, 0, 0],
             info_hash: [134, 212, 200, 0, 36, 164, 105, 190, 76, 80, 188, 90, 16, 44, 247, 23, 128, 49, 0, 116],
             peer_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
         };
 
-        let encoded = DefaultOptions::new()
-            .with_varint_encoding()
-            .serialize(&handshake)
-            .unwrap();
+        let encoded = bincode::serialize(&handshake).unwrap();
 
         assert_eq!(encoded, [19, 66, 105, 116, 84, 111, 114, 114, 101, 110, 116, 32, 112, 114, 111, 116, 111, 99, 111, 108, 0, 0, 0, 0, 0, 0, 0, 0, 134, 212, 200, 0, 36, 164, 105, 190, 76, 80, 188, 90, 16, 44, 247, 23, 128, 49, 0, 116, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
     }
@@ -588,7 +575,7 @@ mod tests {
         let mut input: &[u8] = &[0, 0, 0, 5, 4, 1, 2, 3, 4];
         let msg = Message::read(&mut input).unwrap();
         assert_eq!(msg, Some(Message {
-            id: MessageId::Have,
+            id: btid::HAVE,
             payload: [1,2,3,4].to_vec(),
         }));
 
@@ -602,7 +589,7 @@ mod tests {
         let msg = Message::read(&mut input).unwrap().unwrap();
 
         assert_eq!(msg, Message {
-            id: MessageId::Unchoke,
+            id: btid::UNCHOKE,
             payload: vec![],
         });
     }
