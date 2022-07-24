@@ -13,7 +13,7 @@ use bit_vec::BitVec;
 use sha1::{Sha1, Digest};
 use serde_bencode::de;
 use serde_bytes::ByteBuf;
-use std::{time::Duration, net::{TcpStream, IpAddr, SocketAddr}, sync::{Arc, Mutex}};
+use std::{time::Duration, net::{TcpStream, IpAddr, SocketAddr}, sync::{Arc, Mutex}, fs::OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom, Result as IoResult};
 
 use reqwest::Url;
@@ -126,24 +126,50 @@ impl Torrent {
         url.to_string()
     }
 
-    fn start<W: Write + Seek>(self, writer: &mut W) -> IoResult<()> {
+    fn start<F: Read + Write + Seek>(self, file: &mut F) -> IoResult<()> {
         info!("Starting download for {}", self.name);
 
         // create a multi-producer, multi-consumer queue with specified capacity
         let (tx, rx) = bounded::<PieceWork>(self.pieces.len());
 
-        // fill work queue
-        for (i, piece) in self.pieces.iter().enumerate() {
-            let begin = (i as i64) * self.piece_len;
-            let piecesize = (begin+self.piece_len).min(self.file_len) - begin;
-
-            tx.send(PieceWork {
-                index: i,
-                hash: *piece,
-                length: piecesize as u32,
-            }).unwrap();
+        let mut downloaded_pieces = 0;
+        {
+            let mut terminate = false;
+            self.pieces.iter().enumerate()
+            .map(|(i, &piece)| {
+                let begin = (i as i64) * self.piece_len;
+                let piecesize = (begin+self.piece_len).min(self.file_len) - begin;
+                (i, piece, piecesize)
+            })
+            .filter(|&(_i, piece, len)| {
+                    terminate || {
+                        let mut buf = vec![0u8; len as usize];
+                        match file.read_exact(&mut buf) {
+                            Ok(()) => {
+                                let info_hash: [u8; 20] = Sha1::digest(buf).into();
+                                if piece == info_hash {
+                                    downloaded_pieces += 1;
+                                    return false
+                                }
+                            }
+                            Err(_) => {
+                                // End of file
+                                terminate = true;
+                            }
+                        }
+                        true
+                    }
+                }
+            )
+            .for_each(|(i, piece, len)| {
+                tx.send(PieceWork {
+                    index: i,
+                    hash: piece,
+                    len: len as u32,
+                }).unwrap();
+            });
         }
-
+        
         // store the result in a multi-producer, single-consumer queue
         let (tx_result, rx_result) = std::sync::mpsc::channel::<PieceResult>();
         
@@ -173,14 +199,13 @@ impl Torrent {
         });
 
         // collect download results
-        let mut done_pieces = 0;
-        while done_pieces < self.pieces.len() {
+        while downloaded_pieces < self.pieces.len() {
             let res = rx_result.recv().unwrap();
             let begin = (res.index as i64) * self.piece_len;
-            writer.seek(SeekFrom::Start(begin as u64))?;
-            writer.write_all(&res.buf)?;
-            done_pieces += 1;
-            let percent = (done_pieces as f64 / self.pieces.len() as f64) * 100.0;
+            file.seek(SeekFrom::Start(begin as u64))?;
+            file.write_all(&res.buf)?;
+            downloaded_pieces += 1;
+            let percent = (downloaded_pieces as f64 / self.pieces.len() as f64) * 100.0;
             info!("({:.3}%) Downloaded piece #{:?} from {:?} peers", percent, res.index, *num_peers.lock().unwrap());
         }
         Ok(())
@@ -191,7 +216,7 @@ impl Torrent {
 struct PieceWork {
     index: usize,
     hash: [u8; 20],
-    length: u32,
+    len: u32,
 }
 
 struct PieceResult {
@@ -389,14 +414,14 @@ fn attempt_download_piece(client: &mut Client, pw: &PieceWork) -> Result<Vec<u8>
     let mut backlog = 0;
     let mut requested = 0;
 
-    let mut buf =  vec![0u8; pw.length as usize]; 
+    let mut buf =  vec![0u8; pw.len as usize]; 
 
-    while downloaded < pw.length {
+    while downloaded < pw.len {
         if !client.choked {
             // if unchoked, send requests untill we have enough unfulfilled requests
-            while backlog < MAX_BACKLOG && requested < pw.length {
+            while backlog < MAX_BACKLOG && requested < pw.len {
                 // Last block might be shorter than the max blocksize
-                let blocksize = pw.length.min(requested+MAX_BLOCKSIZE) - requested;
+                let blocksize = pw.len.min(requested+MAX_BLOCKSIZE) - requested;
 
                 client.send_message(btid::REQUEST, Some([
                     (pw.index as u32).to_be_bytes(), 
@@ -462,10 +487,15 @@ fn main() -> IoResult<()> {
     let args = std::env::args().collect::<Vec<String>>();
     let filename = args.get(1).expect("no torrent file specified");
     let bytes = std::fs::read(filename)?;
-
     let torrent = de::from_bytes::<Torrent>(&bytes).unwrap();
-    let mut f = std::fs::File::create(&torrent.name)?;
-    torrent.start(&mut f)?;
+
+    let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&torrent.name)?;
+
+    torrent.start(&mut file)?;
 
     Ok(())
 }
@@ -499,7 +529,7 @@ mod tests {
             tx.send(PieceWork {
                 index: i,
                 hash: *piece,
-                length: piece_size as u32,
+                len: piece_size as u32,
             }).unwrap();
         }
 
