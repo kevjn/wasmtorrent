@@ -11,9 +11,8 @@ extern crate serde_bytes;
 
 use bit_vec::BitVec;
 use sha1::{Sha1, Digest};
-use serde_bencode::de;
 use serde_bytes::ByteBuf;
-use std::{time::Duration, net::{TcpStream, IpAddr, SocketAddr}, sync::{Arc, Mutex}, fs::OpenOptions};
+use std::{time::Duration, io::ErrorKind as IoErrorKind, net::{TcpStream, IpAddr, SocketAddr}, sync::{Arc, Mutex}};
 use std::io::{Read, Write, Seek, SeekFrom, Result as IoResult};
 
 use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
@@ -56,13 +55,13 @@ struct BencodeTorrent {
 
 // A flat structure for working with single torrent files
 #[derive(Debug)]
-struct Torrent {
-    announce: String,
-    info_hash: [u8; 20],
-    pieces: Vec<[u8; 20]>,
-    piece_len: i64,
-    file_len: i64,
-    name: String,
+pub struct Torrent {
+    pub announce: String,
+    pub info_hash: [u8; 20],
+    pub pieces: Vec<[u8; 20]>,
+    pub piece_len: i64,
+    pub file_len: i64,
+    pub name: String,
 }
 
 impl<'de> serde::Deserialize<'de> for Torrent {
@@ -73,7 +72,7 @@ impl<'de> serde::Deserialize<'de> for Torrent {
         let torrent: BencodeTorrent = serde::Deserialize::deserialize(deserializer)?;
 
         // calculate sha1 hash for Torrent info
-        let bytes = serde_bencode::ser::to_bytes(&torrent.info).unwrap();
+        let bytes = serde_bencode::to_bytes(&torrent.info).unwrap();
         let info_hash = Sha1::digest(bytes).into();
 
         // split pieces into slice of hashes where each slice is 20 bytes
@@ -118,7 +117,7 @@ impl Torrent {
         format!("{}?{}", self.announce, query)
     }
 
-    fn start<F: Read + Write + Seek>(self, file: &mut F) -> IoResult<()> {
+    pub fn start<F: Read + Write + Seek>(self, file: &mut F) -> IoResult<()> {
         info!("Starting download for {}", self.name);
 
         // create a multi-producer, multi-consumer queue with specified capacity
@@ -144,10 +143,10 @@ impl Torrent {
                                     return false
                                 }
                             }
-                            Err(_) => {
-                                // End of file
+                            Err(ref e) if e.kind() == IoErrorKind::UnexpectedEof => {
                                 terminate = true;
-                            }
+                            },
+                            Err(e) => panic!("Can't read from file {:?}", e),
                         }
                         true
                     }
@@ -169,7 +168,7 @@ impl Torrent {
         let tracker_url = self.build_tracker_url(&RANDOM_ID, 6882);
         // announce our presence to the tracker
         let bytes = reqwest::blocking::get(tracker_url).unwrap().bytes().unwrap();
-        let response: BencodeTrackerResp = de::from_bytes(&bytes).unwrap();
+        let response: BencodeTrackerResp = serde_bencode::from_bytes(&bytes).unwrap();
 
         // start workers
         let num_peers = Arc::new(Mutex::new(0));
@@ -205,15 +204,15 @@ impl Torrent {
 }
 
 #[derive(Debug)]
-struct PieceWork {
-    index: usize,
-    hash: [u8; 20],
-    len: u32,
+pub struct PieceWork {
+    pub index: usize,
+    pub hash: [u8; 20],
+    pub len: u32,
 }
 
-struct PieceResult {
-    index: usize,
-    buf: Vec<u8>,
+pub struct PieceResult {
+    pub index: usize,
+    pub buf: Vec<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -348,7 +347,7 @@ impl Client {
 
 }
 
-fn spawn_connector_task(
+pub fn start_download_task(
     peer: SocketAddr, 
     tx: Sender<PieceWork>, 
     rx: Receiver<PieceWork>, 
