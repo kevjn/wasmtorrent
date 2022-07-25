@@ -468,72 +468,11 @@ fn attempt_download_piece(client: &mut Client, pw: &PieceWork) -> Result<Vec<u8>
     Ok(buf)
 }
 
-fn main() -> IoResult<()> {
-    tracing_subscriber::fmt()
-        .with_thread_ids(true)
-        .with_line_number(true)
-        .without_time()
-        .init();
-
-    let args = std::env::args().collect::<Vec<String>>();
-    let filename = args.get(1).expect("no torrent file specified");
-    let bytes = std::fs::read(filename)?;
-    let torrent = de::from_bytes::<Torrent>(&bytes).unwrap();
-
-    let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&torrent.name)?;
-
-    torrent.start(&mut file)?;
-
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     
-    #[test]
-    #[ignore]
-    fn test_download_localhost() {
-        tracing_subscriber::fmt()
-            .with_thread_ids(true)
-            .with_line_number(true)
-            .without_time()
-            .init();
-
-        let bytes = std::fs::read("./testdata/debian-11.4.0-amd64-netinst.iso.torrent").unwrap();
-        let torrent = de::from_bytes::<Torrent>(&bytes).unwrap();
-        
-        // the peer we want to connect to
-        let peer = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 31916);
-
-        // fill work queue
-        let (tx, rx) = bounded::<PieceWork>(torrent.pieces.len());
-        for (i, piece) in torrent.pieces.iter().enumerate() {
-            let begin = (i as i64) * torrent.piece_len;
-            let end = std::cmp::min(begin + torrent.piece_len, torrent.file_len);
-            let piece_size = end - begin;
-
-            tx.send(PieceWork {
-                index: i,
-                hash: *piece,
-                len: piece_size as u32,
-            }).unwrap();
-        }
-
-        // store the result in a multi-producer, single-consumer queue
-        let (tx_result, rx_result) = std::sync::mpsc::channel::<PieceResult>();
-
-        match spawn_connector_task(peer, tx, rx, tx_result, &torrent.info_hash) {
-            Ok(()) => info!("success"),
-            Err(error) => info!("Disconnecting from {:?} with error ({:?})", peer, error),
-        }
-
-    }
-
     #[test]
     fn test_build_tracker_url() {
         let to = Torrent {
