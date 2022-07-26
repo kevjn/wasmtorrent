@@ -1,0 +1,14 @@
+[package]
+name = "test-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+torrentclient = { path = "../.." }
+log = "0.4"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tracing-test = "0.2.3"
+serde_bencode = "^0.2.3"
+crossbeam-channel = "0.5.5"
+clap = { version = "3.2.14", features = ["derive"] }
