@@ -18,7 +18,8 @@ fn main() -> IoResult<()> {
             .create(true)
             .open(&torrent.name)?;
 
-    torrent.start(&mut file)?;
+    let peers: Vec<std::net::SocketAddr> = torrent.request_peers()?;
+    torrent.download(&mut file, &peers)?;
 
     Ok(())
 }

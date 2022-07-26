@@ -44,6 +44,7 @@ struct BencodeInfo {
     #[serde(default)]
     length: Option<i64>,
     name: String,
+    private: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,7 +80,7 @@ impl<'de> serde::Deserialize<'de> for Torrent {
         let pieces: &[[u8; 20]] = torrent.info.pieces.as_chunks().0;
 
         Ok(Torrent {
-            announce: torrent.announce.unwrap(),
+            announce: torrent.announce.unwrap_or_default(),
             info_hash,
             pieces: pieces.into(),
             piece_len: torrent.info.piece_length,
@@ -117,7 +118,21 @@ impl Torrent {
         format!("{}?{}", self.announce, query)
     }
 
-    pub fn start<F: Read + Write + Seek>(self, file: &mut F) -> IoResult<()> {
+    pub fn request_peers(&self) -> IoResult<Vec<SocketAddr>> {
+        // identifies the file we want to download
+        let tracker_url = self.build_tracker_url(&RANDOM_ID, 8080);
+        // announce our presence to the tracker
+        // TODO: don't use unwrap here
+        let bytes = reqwest::blocking::get(tracker_url).unwrap().bytes().unwrap();
+        let response: BencodeTrackerResp = serde_bencode::from_bytes(&bytes).unwrap();
+
+        Ok(response.peers.array_chunks().map(|x: &[u8; 6]| {
+            let (ip, port) = x.split_array_ref::<4>();
+            SocketAddr::new(IpAddr::from(*ip), BigEndian::read_u16(port))
+        }).collect())
+    }
+
+    pub fn download<F: Read + Write + Seek>(self, file: &mut F, peers: &Vec<SocketAddr>) -> IoResult<()> {
         info!("Starting download for {}", self.name);
 
         // create a multi-producer, multi-consumer queue with specified capacity
@@ -160,26 +175,16 @@ impl Torrent {
                 }).unwrap();
             });
         }
-        
+
         // store the result in a multi-producer, single-consumer queue
         let (tx_result, rx_result) = std::sync::mpsc::channel::<PieceResult>();
-        
-        // identifies the file we want to download
-        let tracker_url = self.build_tracker_url(&RANDOM_ID, 6882);
-        // announce our presence to the tracker
-        let bytes = reqwest::blocking::get(tracker_url).unwrap().bytes().unwrap();
-        let response: BencodeTrackerResp = serde_bencode::from_bytes(&bytes).unwrap();
 
         // start workers
         let num_peers = Arc::new(Mutex::new(0));
-
-        response.peers.array_chunks().for_each(|x: &[u8; 6]| {
-            let (ip, port) = x.split_array_ref::<4>();
-            let peer = SocketAddr::new(IpAddr::from(*ip), BigEndian::read_u16(port));
-
+        for &peer in peers {
             *num_peers.lock().unwrap() += 1;
             std::thread::spawn(enclose! { (tx, rx, tx_result, num_peers) move || {
-                match spawn_connector_task(peer, tx, rx, tx_result, &self.info_hash) {
+                match start_download_task(peer, tx, rx, tx_result, &self.info_hash) {
                     Ok(()) => info!("success"),
                     Err(error) => {
                         *num_peers.lock().unwrap() -= 1;
@@ -187,7 +192,7 @@ impl Torrent {
                     }
                 }
             } });
-        });
+        };
 
         // collect download results
         while downloaded_pieces < self.pieces.len() {
@@ -197,7 +202,7 @@ impl Torrent {
             file.write_all(&res.buf)?;
             downloaded_pieces += 1;
             let percent = (downloaded_pieces as f64 / self.pieces.len() as f64) * 100.0;
-            info!("({:.3}%) Downloaded piece #{:?} from {:?} peers", percent, res.index, *num_peers.lock().unwrap());
+            info!("({:.2}%) Downloaded piece #{:?} from {:?} peers", percent, res.index, *num_peers.lock().unwrap());
         }
         Ok(())
     }
@@ -504,7 +509,7 @@ mod tests {
             )
         };
 
-        let response: BencodeTrackerResp = de::from_bytes(str.as_bytes()).unwrap();
+        let response: BencodeTrackerResp = serde_bencode::from_bytes(str.as_bytes()).unwrap();
 
         let r = response.peers.array_chunks().map(|x: &[u8; 6]| {
             let ip: [u8; 4] = x[0..4].try_into().unwrap();
