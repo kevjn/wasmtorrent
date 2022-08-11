@@ -11,6 +11,9 @@ wasmtorrent = { path = '../../'}
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4.32"
 
+log = "0.4"
+console_log = { version = "0.2", features = ["color"] }
+
 [dependencies.web-sys]
 features = [
     "RtcDataChannel",

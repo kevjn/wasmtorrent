@@ -1,5 +1,11 @@
 use wasm_bindgen::{prelude::*, JsCast};
 
+#[wasm_bindgen(start)]
+pub fn run() -> Result<(), JsValue> {
+    console_log::init_with_level(log::Level::Debug).unwrap();
+    Ok(())
+}
+
 #[wasm_bindgen(module = "/aux.js")]
 extern {
     pub fn download_file(data: &[u8], name: &str);
