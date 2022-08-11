@@ -1,13 +1,8 @@
-use std::{io::{Result as IoResult}, fs::OpenOptions};
+use std::{io::{Result as IoResult}, fs::OpenOptions, net::ToSocketAddrs};
 
-use torrentclient::Torrent;
+use wasmtorrent::Torrent;
 
 fn main() -> IoResult<()> {
-    tracing_subscriber::fmt()
-        .with_thread_ids(true)
-        .with_line_number(true)
-        .without_time()
-        .init();
 
     let args = std::env::args().collect::<Vec<String>>();
     let filename = args.get(1).expect("no torrent file specified");
@@ -24,7 +19,9 @@ fn main() -> IoResult<()> {
 
     torrent.init_state(&mut file)?;
 
-    torrent.download(&mut file, peers)?;
+    // torrent.download(&mut file, peers)?;
+
+    torrent.seed(file, "0.0.0.0:8080".parse().unwrap())?;
 
     Ok(())
 }
