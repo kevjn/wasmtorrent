@@ -11,6 +11,7 @@ extern crate serde_bencode;
 extern crate serde_derive;
 extern crate serde_bytes;
 
+use async_trait::async_trait;
 use bincode::Options;
 use bit_vec::BitVec;
 use futures::StreamExt;
@@ -185,28 +186,39 @@ impl tokio::io::AsyncWrite for DataStream {
 #[cfg(target_arch = "wasm32")]
 pub trait Send = ;
 
+#[cfg(target_arch = "wasm32")]
+#[async_trait(?Send)]
 pub trait ToAsyncRW {
     type Output: AsyncRead + AsyncWriteExt + Unpin + Send;
 
-    fn to_data_stream(self) -> Self::Output;
+    async fn to_data_stream(self) -> IoResult<Self::Output>;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[async_trait]
+pub trait ToAsyncRW {
+    type Output: AsyncRead + AsyncWriteExt + Unpin + Send;
+
+    async fn to_data_stream(self) -> IoResult<Self::Output>;
 }
 
 #[cfg(target_arch = "wasm32")]
+#[async_trait(?Send)]
 impl ToAsyncRW for web_sys::RtcDataChannel {
     type Output = DataStream;
 
-    fn to_data_stream(self) -> Self::Output {
-        DataStream::new(self)
+    async fn to_data_stream(self) -> IoResult<Self::Output> {
+        Ok(DataStream::new(self))
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-impl<A: tokio::net::ToSocketAddrs> ToAsyncRW for A {
+#[async_trait]
+impl ToAsyncRW for SocketAddr {
     type Output = tokio::net::TcpStream;
 
-    fn to_data_stream(self) -> Self::Output {
-        todo!()
-        // std::net::TcpStream::connect_timeout(self, Duration::from_secs(3)).unwrap();
+    async fn to_data_stream(self) -> IoResult<Self::Output> {
+        tokio::net::TcpStream::connect(self).await
     }
 }
 
@@ -325,11 +337,11 @@ impl Torrent {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn request_peers(&self) -> IoResult<Vec<SocketAddr>> {
+    pub async fn request_peers(&self) -> IoResult<Vec<SocketAddr>> {
         // identifies the file we want to download
         let tracker_url = self.build_tracker_url(&PEER_ID, 8080);
         // announce our presence to the tracker, TODO: don't use unwrap here
-        let bytes = reqwest::blocking::get(tracker_url).unwrap().bytes().unwrap();
+        let bytes = reqwest::get(tracker_url).await.unwrap().bytes().await.unwrap();
         let response: BencodeTrackerResp = serde_bencode::from_bytes(&bytes).unwrap();
 
         Ok(response.peers.array_chunks().map(|x: &[u8; 6]| {
@@ -384,20 +396,24 @@ impl Torrent {
         let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<PieceResult>(self.pieces.len());
 
         // a multi-producer, multi-consumer queue with specified capacity
-        let (tx, rx) = (&self.work_tx, &self.work_rx);
+        let (work_tx, work_rx) = (&self.work_tx, &self.work_rx);
         
         // thread-safe counter for number of active peers
         let num_peers = Arc::new(Mutex::new(0));
 
         // start workers
         for peer in peers {
-            spawn(enclose! { (tx, rx, result_tx) async move {
-                if let Err(e) = start_download_task(peer.to_data_stream(), tx, rx, result_tx, &self.info_hash).await {
+            spawn(enclose! { (work_tx, work_rx, result_tx, num_peers) async move {
+                let peer = peer.to_data_stream().await.unwrap();
+                info!("Starting new download task");
+                *num_peers.lock().unwrap() += 1;
+                if let Err(e) = start_download_task(peer, work_tx, work_rx, result_tx, &self.info_hash).await {
                     info!("Disconnecting from peer with error: {:?}", e);
+                    *num_peers.lock().unwrap() -= 1;
                 }
             } });
         }
-        
+
         let mut downloaded_pieces = self.bitfield.iter().fold(0, |acc, x| acc + x as usize);
 
         // collect download results
@@ -451,7 +467,8 @@ impl Torrent {
             let f = file.clone();
             let bf = self.bitfield.clone();
             spawn(async move {
-                if let Err(e) = start_upload_task(peer.to_data_stream(), self.piece_len, &self.info_hash, &bf, f).await {
+                let peer = peer.to_data_stream().await.unwrap();
+                if let Err(e) = start_upload_task(peer, self.piece_len, &self.info_hash, &bf, f).await {
                     info!("error: {:?}", e.to_string());
                 }
             });
