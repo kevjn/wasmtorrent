@@ -28,6 +28,9 @@ use crossbeam_channel::{bounded, Sender, Receiver};
 #[macro_use] 
 extern crate log;
 
+#[macro_use]
+extern crate lazy_static;
+
 // https://github.com/rust-webplatform/rust-todomvc/blob/51cbd62e906a6274d951fd7a8f5a6c33fcf8e7ea/src/main.rs#L34-L41
 macro_rules! enclose {
     ( ($( $x:ident ),*) $y:expr ) => {
@@ -130,7 +133,9 @@ impl DataStream {
                     panic!("error reading from RtcDataChannel");
                 }
             };
-            tx.try_send(data).unwrap();
+            if let Err(e) = tx.try_send(data) {
+                error!("Error sending via channel: {:?}", e);
+            }
         });
         inner.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
         onmessage.forget();
@@ -182,22 +187,9 @@ impl tokio::io::AsyncWrite for DataStream {
     }
 }
 
-// When compiling against webassembly we don't need the Send trait with async
-#[cfg(target_arch = "wasm32")]
-pub trait Send = ;
-
-#[cfg(target_arch = "wasm32")]
 #[async_trait(?Send)]
 pub trait ToAsyncRW {
-    type Output: AsyncRead + AsyncWriteExt + Unpin + Send;
-
-    async fn to_data_stream(self) -> IoResult<Self::Output>;
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[async_trait]
-pub trait ToAsyncRW {
-    type Output: AsyncRead + AsyncWriteExt + Unpin + Send;
+    type Output: AsyncRead + AsyncWriteExt + Unpin;
 
     async fn to_data_stream(self) -> IoResult<Self::Output>;
 }
@@ -213,24 +205,13 @@ impl ToAsyncRW for web_sys::RtcDataChannel {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-#[async_trait]
+#[async_trait(?Send)]
 impl ToAsyncRW for SocketAddr {
     type Output = tokio::net::TcpStream;
 
     async fn to_data_stream(self) -> IoResult<Self::Output> {
         tokio::net::TcpStream::connect(self).await
     }
-}
-
-#[cfg(target_arch = "wasm32")]
-fn spawn<F>(future: F) where F: futures::Future<Output = ()> + 'static, {
-    wasm_bindgen_futures::spawn_local(future);
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn spawn<F>(future: F) -> tokio::task::JoinHandle<F::Output>
-where F: futures::Future + Send + 'static, F::Output: Send + 'static,  {
-    tokio::spawn(future)
 }
 
 impl<'de> serde::Deserialize<'de> for Torrent {
@@ -376,7 +357,7 @@ impl Torrent {
 
     }
 
-    pub async fn download<W: Write + Seek, A: ToAsyncRW + Send + 'static>(self, file: &mut W, peers: Vec<A>) -> IoResult<()> {
+    pub async fn download<W: Write + Seek, A: ToAsyncRW>(mut self, file: &mut W, peers: Vec<A>) -> IoResult<()> {
         info!("Starting download for {}", self.name);
 
         if self.work_tx.is_empty() {
@@ -402,31 +383,37 @@ impl Torrent {
         let num_peers = Arc::new(Mutex::new(0));
 
         // start workers
-        for peer in peers {
-            spawn(enclose! { (work_tx, work_rx, result_tx, num_peers) async move {
-                let peer = peer.to_data_stream().await.unwrap();
-                info!("Starting new download task");
-                *num_peers.lock().unwrap() += 1;
-                if let Err(e) = start_download_task(peer, work_tx, work_rx, result_tx, &self.info_hash).await {
-                    info!("Disconnecting from peer with error: {:?}", e);
-                    *num_peers.lock().unwrap() -= 1;
+        let workers = futures::future::join_all(peers.into_iter().map(|peer| {
+            enclose! { (work_tx, work_rx, result_tx, num_peers) async move {
+                if let Ok(peer) = peer.to_data_stream().await {
+                    *num_peers.lock().unwrap() += 1;
+                    if let Err(e) = start_download_task(peer, work_tx, work_rx, result_tx, &self.info_hash).await {
+                        info!("Disconnecting from peer with error: {:?}", e);
+                        *num_peers.lock().unwrap() -= 1;
+                    } else {
+                        info!("Done with download task");
+                    }
                 }
-            } });
-        }
+            } }
+        }));
 
         let mut downloaded_pieces = self.bitfield.iter().fold(0, |acc, x| acc + x as usize);
 
         // collect download results
-        while downloaded_pieces < self.pieces.len() {
-            let res = result_rx.recv().await.unwrap();
-            let begin = (res.index as i64) * self.piece_len;
-            file.seek(SeekFrom::Start(begin as u64))?;
-            file.write_all(&res.buf)?;
-            downloaded_pieces += 1;
-            let percent = (downloaded_pieces as f64 / self.pieces.len() as f64) * 100.0;
-            info!("({:.2}%) Downloaded piece #{:?} from {:?} peers", percent, res.index, *num_peers.lock().unwrap());
-            // self.bitfield.set(res.index, true);
-        }
+        let result = async move {
+            while downloaded_pieces < self.pieces.len() {
+                let res = result_rx.recv().await.unwrap();
+                let begin = (res.index as i64) * self.piece_len;
+                file.seek(SeekFrom::Start(begin as u64)).unwrap();
+                file.write_all(&res.buf).unwrap();
+                downloaded_pieces += 1;
+                let percent = (downloaded_pieces as f64 / self.pieces.len() as f64) * 100.0;
+                info!("({:.2}%) Downloaded piece #{:?} from {:?} peers", percent, res.index, *num_peers.lock().unwrap());
+                self.bitfield.set(res.index, true);
+            }
+        };
+
+        futures::future::join(result, workers).await;
 
         Ok(())
     }
@@ -457,22 +444,20 @@ impl Torrent {
         Ok(())
     }
 
-    pub fn seed_to_connections<R: Read + Seek + Send + 'static, A: ToAsyncRW + Send + 'static>(mut self, file: R, peers: Vec<A>) {
+    pub async fn seed_to_connections<R: Read + Seek + Send + 'static, A: ToAsyncRW>(mut self, file: R, peers: Vec<A>) {
         let file = Arc::new(Mutex::new(file));
 
         // assume the file is complete
         self.bitfield.set_all();
 
-        for peer in peers {
-            let f = file.clone();
-            let bf = self.bitfield.clone();
-            spawn(async move {
+        futures::future::join_all(peers.into_iter().map(|peer| {
+            enclose! { (file) async {
                 let peer = peer.to_data_stream().await.unwrap();
-                if let Err(e) = start_upload_task(peer, self.piece_len, &self.info_hash, &bf, f).await {
+                if let Err(e) = start_upload_task(peer, self.piece_len, &self.info_hash, &self.bitfield, file).await {
                     info!("error: {:?}", e.to_string());
                 }
-            });
-        }
+            } }
+        })).await;
 
     }
 
@@ -483,7 +468,16 @@ struct BencodeTrackerResp {
     peers: ByteBuf,
 }
 
-const PEER_ID: &[u8; 20] = b"wasmtorrent-12345678";
+// const PEER_ID: &[u8; 20] = b"wasmtorrent-12345678";
+
+lazy_static! {
+    /// This is an random id generated once at runtime
+    static ref PEER_ID: [u8; 20] = {
+        rand::Rng::sample_iter(rand::thread_rng(), &rand::distributions::Alphanumeric)
+                .take(20)
+                .collect::<Vec<u8>>().try_into().unwrap()
+    };
+}
 
 impl Handshake {
     fn new(info_hash: &[u8; 20]) -> Handshake {
@@ -541,10 +535,12 @@ impl Message {
 }
 
 async fn send_message<W: AsyncWrite + Unpin>(peer: &mut W, id: u8, payload: Option<Vec<u8>>) -> IoResult<()> {
-    Message {
+    let msg = Message {
         id,
         payload: payload.unwrap_or_default()
-    }.serialize(peer).await
+    };
+    debug!("sending {:?}", msg);
+    msg.serialize(peer).await
 }
 
 pub async fn start_download_task<A: AsyncRead + AsyncWriteExt + Unpin>(
@@ -582,9 +578,10 @@ pub async fn start_download_task<A: AsyncRead + AsyncWriteExt + Unpin>(
     send_message(&mut peer, btid::UNCHOKE, None).await?;
     send_message(&mut peer, btid::INTEREST, None).await?;
 
-    for pw in work_rx {
+    while let Ok(pw) = work_rx.try_recv() {
+    // for pw in work_rx {
         if !bitfield[pw.index] {
-            work_tx.send(pw).unwrap(); // put piece back on the queue
+            work_tx.send(pw)?; // put piece back on the queue
             continue;
         }
 
@@ -592,7 +589,7 @@ pub async fn start_download_task<A: AsyncRead + AsyncWriteExt + Unpin>(
         let buf = match attempt_download_piece(&mut peer, &mut choked, &mut bitfield, &pw).await {
             Ok(buf) => buf,
             Err(error) => {
-                work_tx.send(pw).unwrap();
+                work_tx.send(pw)?;
                 error!("Failed to download piece {:?}, Exiting", error);
                 return Err(error);
             }
@@ -601,7 +598,7 @@ pub async fn start_download_task<A: AsyncRead + AsyncWriteExt + Unpin>(
         // check integrity of the piece
         let hash: [u8; 20] = Sha1::digest(&buf).into();
         if hash != pw.hash {
-            work_tx.send(pw).unwrap();
+            work_tx.send(pw)?;
             error!("hashes do not match");
             continue;
         }
