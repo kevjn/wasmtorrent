@@ -18,9 +18,4 @@ export function download_file(data, name) {
         URL.revokeObjectURL(link.href);
         link.parentNode.removeChild(link);
     }, 0);
-
-    // const link = document.createElement('a');
-    // link.href = window.URL.createObjectURL(blob);
-    // link.download = 'File Name';
-    // link.click();
 }
