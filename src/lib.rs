@@ -11,14 +11,13 @@ extern crate serde_bencode;
 extern crate serde_derive;
 extern crate serde_bytes;
 
-use async_trait::async_trait;
 use bincode::Options;
 use bit_vec::BitVec;
-use futures::StreamExt;
+use futures::{StreamExt, FutureExt};
 use sha1::{Sha1, Digest};
 use serde_bytes::ByteBuf;
 use tokio::{io::{AsyncRead, AsyncWriteExt, AsyncReadExt, AsyncWrite}, sync::mpsc};
-use std::{time::Duration, io::{ErrorKind as IoErrorKind, Read, Seek, SeekFrom, Write}, net::{IpAddr, SocketAddr, TcpListener, TcpStream}, sync::{Arc, Mutex}, task::Poll};
+use std::{time::Duration, io::{ErrorKind as IoErrorKind, Read, Seek, SeekFrom, Write}, net::{IpAddr, SocketAddr, TcpListener, TcpStream}, sync::{Arc, Mutex}, task::Poll, rc::Rc};
 use std::io::{Result as IoResult};
 
 use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
@@ -120,7 +119,7 @@ pub struct DataStream {
 
 #[cfg(target_arch = "wasm32")]
 impl DataStream {
-    fn new(inner: web_sys::RtcDataChannel) -> Self {
+    pub fn new(inner: web_sys::RtcDataChannel) -> Self {
         inner.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
         let (mut tx, rx_inbound) = futures::channel::mpsc::channel(32);
         let onmessage = Closure::<dyn FnMut(_)>::new(move |ev: web_sys::MessageEvent| {
@@ -137,7 +136,7 @@ impl DataStream {
                 error!("Error sending via channel: {:?}", e);
             }
         });
-        inner.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+        inner.add_event_listener_with_callback("message", onmessage.as_ref().unchecked_ref()).unwrap();
         onmessage.forget();
         Self { inner, rx_inbound }
     }
@@ -184,33 +183,6 @@ impl tokio::io::AsyncWrite for DataStream {
 
     fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), std::io::Error>> {
         Poll::Ready(Ok(()))
-    }
-}
-
-#[async_trait(?Send)]
-pub trait ToAsyncRW {
-    type Output: AsyncRead + AsyncWriteExt + Unpin;
-
-    async fn to_data_stream(self) -> IoResult<Self::Output>;
-}
-
-#[cfg(target_arch = "wasm32")]
-#[async_trait(?Send)]
-impl ToAsyncRW for web_sys::RtcDataChannel {
-    type Output = DataStream;
-
-    async fn to_data_stream(self) -> IoResult<Self::Output> {
-        Ok(DataStream::new(self))
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[async_trait(?Send)]
-impl ToAsyncRW for SocketAddr {
-    type Output = tokio::net::TcpStream;
-
-    async fn to_data_stream(self) -> IoResult<Self::Output> {
-        tokio::net::TcpStream::connect(self).await
     }
 }
 
@@ -318,17 +290,19 @@ impl Torrent {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub async fn request_peers(&self) -> IoResult<Vec<SocketAddr>> {
+        pub async fn request_peers(&self) -> impl futures::stream::Stream<Item = impl futures::Future<Output = IoResult<impl AsyncRead + AsyncWrite + Unpin>>> {
         // identifies the file we want to download
         let tracker_url = self.build_tracker_url(&PEER_ID, 8080);
         // announce our presence to the tracker, TODO: don't use unwrap here
         let bytes = reqwest::get(tracker_url).await.unwrap().bytes().await.unwrap();
         let response: BencodeTrackerResp = serde_bencode::from_bytes(&bytes).unwrap();
 
-        Ok(response.peers.array_chunks().map(|x: &[u8; 6]| {
-            let (ip, port) = x.split_array_ref::<4>();
-            SocketAddr::new(IpAddr::from(*ip), BigEndian::read_u16(port))
-        }).collect())
+        futures::stream::iter((0..response.peers.len()).step_by(6).map(move |i| {
+            let x = &response.peers[i..i + 6];
+            let (&ip, port) = x.split_array_ref::<4>();
+            let s = SocketAddr::new(IpAddr::from(ip), BigEndian::read_u16(port));
+            tokio::net::TcpStream::connect(s)
+        }))
     }
 
     pub fn init_state<R: Read>(&mut self, file: &mut R) -> IoResult<()> {
@@ -357,7 +331,7 @@ impl Torrent {
 
     }
 
-    pub async fn download<W: Write + Seek, A: ToAsyncRW>(mut self, file: &mut W, peers: Vec<A>) -> IoResult<()> {
+    pub async fn download<W: Write + Seek>(mut self, file: &mut W, peers: impl futures::stream::Stream<Item = impl futures::Future<Output = IoResult<impl AsyncRead + AsyncWrite + Unpin>>>) -> IoResult<()> {
         info!("Starting download for {}", self.name);
 
         if self.work_tx.is_empty() {
@@ -379,13 +353,12 @@ impl Torrent {
         // a multi-producer, multi-consumer queue with specified capacity
         let (work_tx, work_rx) = (&self.work_tx, &self.work_rx);
         
-        // thread-safe counter for number of active peers
-        let num_peers = Arc::new(Mutex::new(0));
+        // counter for number of active peers
+        let num_peers= Rc::new(Mutex::new(0));
 
-        // start workers
-        let workers = futures::future::join_all(peers.into_iter().map(|peer| {
+        let workers = peers.for_each_concurrent(None, |f| {
             enclose! { (work_tx, work_rx, result_tx, num_peers) async move {
-                if let Ok(peer) = peer.to_data_stream().await {
+                if let Ok(peer) = f.await {
                     *num_peers.lock().unwrap() += 1;
                     if let Err(e) = start_download_task(peer, work_tx, work_rx, result_tx, &self.info_hash).await {
                         info!("Disconnecting from peer with error: {:?}", e);
@@ -395,12 +368,12 @@ impl Torrent {
                     }
                 }
             } }
-        }));
+        }).boxed_local();
 
         let mut downloaded_pieces = self.bitfield.iter().fold(0, |acc, x| acc + x as usize);
 
         // collect download results
-        let result = async move {
+        let result = async {
             while downloaded_pieces < self.pieces.len() {
                 let res = result_rx.recv().await.unwrap();
                 let begin = (res.index as i64) * self.piece_len;
@@ -411,9 +384,11 @@ impl Torrent {
                 info!("({:.2}%) Downloaded piece #{:?} from {:?} peers", percent, res.index, *num_peers.lock().unwrap());
                 self.bitfield.set(res.index, true);
             }
-        };
+            info!("done with download for {:?}", self.name);
+        }.boxed_local();
 
-        futures::future::join(result, workers).await;
+        // wait for either one of two futures to complete.
+        futures::future::select(workers, result).await;
 
         Ok(())
     }
@@ -444,21 +419,22 @@ impl Torrent {
         Ok(())
     }
 
-    pub async fn seed_to_connections<R: Read + Seek + Send + 'static, A: ToAsyncRW>(mut self, file: R, peers: Vec<A>) {
+    pub async fn seed_to_connections<R: Read + Seek + Send + 'static>(mut self, file: R, peers: impl futures::stream::Stream<Item = impl futures::Future<Output = IoResult<impl AsyncRead + AsyncWrite + Unpin>>>) {
         let file = Arc::new(Mutex::new(file));
 
         // assume the file is complete
         self.bitfield.set_all();
+        let bitfield = &self.bitfield;
 
-        futures::future::join_all(peers.into_iter().map(|peer| {
-            enclose! { (file) async {
-                let peer = peer.to_data_stream().await.unwrap();
-                if let Err(e) = start_upload_task(peer, self.piece_len, &self.info_hash, &self.bitfield, file).await {
-                    info!("error: {:?}", e.to_string());
+        peers.for_each_concurrent(None, |peer| {
+            enclose! { (file) async move {
+                if let Ok(peer) = peer.await {
+                    if let Err(e) = start_upload_task(peer, self.piece_len, &self.info_hash, &bitfield, file).await {
+                        info!("error: {:?}", e.to_string());
+                    }
                 }
             } }
-        })).await;
-
+        }).await;
     }
 
 }
@@ -579,7 +555,6 @@ pub async fn start_download_task<A: AsyncRead + AsyncWriteExt + Unpin>(
     send_message(&mut peer, btid::INTEREST, None).await?;
 
     while let Ok(pw) = work_rx.try_recv() {
-    // for pw in work_rx {
         if !bitfield[pw.index] {
             work_tx.send(pw)?; // put piece back on the queue
             continue;
