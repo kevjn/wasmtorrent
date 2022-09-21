@@ -1,0 +1,28 @@
+[package]
+name = "filesharing"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasmtorrent = { path = '../../'}
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4.32"
+
+log = "0.4"
+console_log = { version = "0.2", features = ["color"] }
+
+js-sys = "0.3.59"
+
+futures = "0.3.21"
+
+tokio = { version = "1", features = ["io-util", "sync"] }
+
+[dependencies.web-sys]
+features = [
+    "RtcDataChannel",
+    "SourceBuffer",
+    "CustomEvent",
+]

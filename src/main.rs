@@ -1,6 +1,7 @@
-use std::{io::{Result as IoResult}, fs::OpenOptions, net::ToSocketAddrs};
+use std::{io::{Result as IoResult}, net::ToSocketAddrs};
 
 use futures::{stream::{self, Stream}, StreamExt};
+use tokio::fs::OpenOptions;
 use wasmtorrent::Torrent;
 
 #[tokio::main]
@@ -20,11 +21,11 @@ async fn main() -> IoResult<()> {
         .read(true)
         .write(true)
         .create(true)
-        .open(&torrent.name)?;
+        .open(&torrent.name).await?;
     
     let peers = torrent.request_peers().await;
 
-    torrent.init_state(&mut file)?;
+    // torrent.init_state(&mut file)?;
 
     torrent.download(&mut file, peers).await?;
 

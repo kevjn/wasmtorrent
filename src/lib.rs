@@ -16,7 +16,7 @@ use bit_vec::BitVec;
 use futures::{StreamExt, FutureExt};
 use sha1::{Sha1, Digest};
 use serde_bytes::ByteBuf;
-use tokio::{io::{AsyncRead, AsyncWriteExt, AsyncReadExt, AsyncWrite}, sync::mpsc};
+use tokio::{io::{AsyncRead, AsyncWriteExt, AsyncReadExt, AsyncWrite, AsyncSeek, AsyncSeekExt}, sync::mpsc};
 use std::{time::Duration, io::{ErrorKind as IoErrorKind, Read, Seek, SeekFrom, Write}, net::{IpAddr, SocketAddr, TcpListener, TcpStream}, sync::{Arc, Mutex}, task::Poll, rc::Rc};
 use std::io::{Result as IoResult};
 
@@ -331,7 +331,7 @@ impl Torrent {
 
     }
 
-    pub async fn download<W: Write + Seek>(mut self, file: &mut W, peers: impl futures::stream::Stream<Item = impl futures::Future<Output = IoResult<impl AsyncRead + AsyncWrite + Unpin>>>) -> IoResult<()> {
+    pub async fn download<W: AsyncWrite + AsyncSeek + Unpin>(mut self, file: &mut W, peers: impl futures::stream::Stream<Item = impl futures::Future<Output = IoResult<impl AsyncRead + AsyncWrite + Unpin>>>) -> IoResult<()> {
         info!("Starting download for {}", self.name);
 
         if self.work_tx.is_empty() {
@@ -377,8 +377,8 @@ impl Torrent {
             while downloaded_pieces < self.pieces.len() {
                 let res = result_rx.recv().await.unwrap();
                 let begin = (res.index as i64) * self.piece_len;
-                file.seek(SeekFrom::Start(begin as u64)).unwrap();
-                file.write_all(&res.buf).unwrap();
+                // file.seek(SeekFrom::Start(begin as u64)).await.unwrap();
+                file.write_all(&res.buf).await.unwrap();
                 downloaded_pieces += 1;
                 let percent = (downloaded_pieces as f64 / self.pieces.len() as f64) * 100.0;
                 info!("({:.2}%) Downloaded piece #{:?} from {:?} peers", percent, res.index, *num_peers.lock().unwrap());
