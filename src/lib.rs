@@ -377,7 +377,7 @@ impl Torrent {
             while downloaded_pieces < self.pieces.len() {
                 let res = result_rx.recv().await.unwrap();
                 let begin = (res.index as i64) * self.piece_len;
-                // file.seek(SeekFrom::Start(begin as u64)).await.unwrap();
+                file.seek(SeekFrom::Start(begin as u64)).await.unwrap();
                 file.write_all(&res.buf).await.unwrap();
                 downloaded_pieces += 1;
                 let percent = (downloaded_pieces as f64 / self.pieces.len() as f64) * 100.0;
@@ -393,33 +393,7 @@ impl Torrent {
         Ok(())
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn seed<R: Read + Seek + Send + 'static>(&self, file: R, listen_addr: SocketAddr) -> IoResult<()> {
-        info!("start listening on {:?}", listen_addr);
-        let listener = TcpListener::bind(listen_addr)?;
-        let file = Arc::new(Mutex::new(file));
-        
-        for socket in listener.incoming() {
-            match socket {
-                Ok(socket) => {
-                    info!("new connection from {:?}", socket.peer_addr().unwrap());
-                    let f = file.clone();
-                    let info_hash = self.info_hash.clone();
-                    let bitfield = self.bitfield.clone();
-                    let piece_len = self.piece_len.clone();
-                    std::thread::spawn(move || {
-                        todo!()
-                        // start_upload_task(socket, piece_len, &info_hash, &bitfield, f);
-                    });
-                }
-                Err(e) => println!("couldn't get client: {:?}", e),
-            }
-        }
-
-        Ok(())
-    }
-
-    pub async fn seed_to_connections<R: Read + Seek + Send + 'static>(mut self, file: R, peers: impl futures::stream::Stream<Item = impl futures::Future<Output = IoResult<impl AsyncRead + AsyncWrite + Unpin>>>) {
+    pub async fn seed<R: Read + Seek + Send>(mut self, file: R, peers: impl futures::stream::Stream<Item = impl futures::Future<Output = IoResult<impl AsyncRead + AsyncWrite + Unpin>>>) {
         let file = Arc::new(Mutex::new(file));
 
         // assume the file is complete
