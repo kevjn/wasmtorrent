@@ -1,9 +1,6 @@
 #![feature(slice_as_chunks)]
-#![feature(array_chunks)]
-#![feature(iterator_try_collect)]
 #![feature(split_array)]
-#![feature(exact_size_is_empty)]
-#![feature(trait_alias)]
+#![feature(int_roundings)]
 
 extern crate serde;
 extern crate serde_bencode;
@@ -13,16 +10,17 @@ extern crate serde_bytes;
 
 use bincode::Options;
 use bit_vec::BitVec;
-use futures::{StreamExt, FutureExt};
+use futures::{StreamExt};
 use sha1::{Sha1, Digest};
 use serde_bytes::ByteBuf;
-use tokio::{io::{AsyncRead, AsyncWriteExt, AsyncReadExt, AsyncWrite, AsyncSeek, AsyncSeekExt}, sync::mpsc};
-use std::{time::Duration, io::{ErrorKind as IoErrorKind, Read, Seek, SeekFrom, Write}, net::{IpAddr, SocketAddr, TcpListener, TcpStream}, sync::{Arc, Mutex}, task::Poll, rc::Rc};
+use tokio::{io::{AsyncRead, AsyncWriteExt, AsyncReadExt, AsyncWrite, AsyncSeek, AsyncSeekExt}};
+use std::{io::{SeekFrom}, net::{IpAddr, SocketAddr}, rc::Rc, collections::{HashMap}, cell::{RefCell}, error::Error, fmt::Debug, panic::Location, task::Poll};
+use tokio::sync::Mutex;
 use std::io::{Result as IoResult};
 
 use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
-use byteorder::{ByteOrder, BigEndian, WriteBytesExt, ReadBytesExt};
-use crossbeam_channel::{bounded, Sender, Receiver};
+use byteorder::{ByteOrder, BigEndian};
+use crossbeam_channel::{Sender, Receiver};
 
 #[macro_use] 
 extern crate log;
@@ -43,36 +41,33 @@ macro_rules! enclose {
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::{prelude::*, JsCast};
 
-#[derive(Debug, Deserialize, Serialize)]
-struct BencodeInfo {
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct BencodeInfo {
     pieces: ByteBuf,
     #[serde(rename = "piece length")]
-    piece_length: i64,
+    piece_len: i64,
     #[serde(default)]
     length: Option<i64>,
-    name: String,
+    pub name: String,
     private: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
-struct BencodeTorrent {
-    info: BencodeInfo,
+pub struct BencodeTorrent {
+    pub info: BencodeInfo,
     #[serde(default)]
-    announce: Option<String>,
+    announce: Option<String>, // tracker url
 }
 
 // A flat structure for working with single torrent files
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Torrent {
-    pub announce: String,
+    pub metadata: Option<BencodeInfo>,
+    pub announce: Option<String>,
     pub info_hash: [u8; 20],
-    pub pieces: Vec<[u8; 20]>,
-    pub piece_len: i64,
-    pub file_len: i64,
-    pub name: String,
-    pub bitfield: BitVec,
-    work_tx: Sender<PieceWork>,
-    work_rx: Receiver<PieceWork>,
+    pub bitfield: BitVec,    
+    piece_trx: Option<(Sender<PieceWork>, Receiver<PieceWork>)>,
+    piece_len: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -108,6 +103,13 @@ struct Handshake {
 struct Message {
     id: u8,
     payload: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ExtMsg {
+    msg_type: i32,
+    piece: i32,
+    total_size: Option<i32>,
 }
 
 // wrapper for websys datachannel
@@ -186,12 +188,46 @@ impl tokio::io::AsyncWrite for DataStream {
     }
 }
 
-impl<'de> serde::Deserialize<'de> for Torrent {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::de::Deserializer<'de>,
-        {
-        let torrent: BencodeTorrent = serde::Deserialize::deserialize(deserializer)?;
+#[derive(Debug)]
+pub struct PeerState {
+    bitfield: BitVec,
+    choked: bool,
+    metadata_size: usize,
+    message_id: u8,
+}
+
+pub struct LocatedError<T> {
+    inner: T,
+    location: &'static Location<'static>
+}
+
+impl std::fmt::Debug for LocatedError<Box<dyn Error>> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}, {}", self.inner, self.location)
+    }
+}
+
+impl<E: Error + 'static> From<E> for LocatedError<Box<dyn Error>> {
+    #[track_caller]
+    fn from(err: E) -> Self {
+        return LocatedError { 
+            inner: Box::new(err), 
+            location: std::panic::Location::caller() 
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum Task {
+    DownloadMetadata,
+    DownloadPieces,
+    SeedPieces,
+    EnqueuePieces,
+}
+
+impl Torrent {
+    pub fn from_torrent_file(bytes: Vec<u8>) -> Self {
+        let torrent: BencodeTorrent = serde_bencode::from_bytes(&bytes).unwrap();
 
         // calculate sha1 hash for Torrent info
         let bytes = serde_bencode::to_bytes(&torrent.info).unwrap();
@@ -203,94 +239,53 @@ impl<'de> serde::Deserialize<'de> for Torrent {
         // initialize empty bitfield
         let bitfield = BitVec::from_elem(pieces.len(), false);
 
-        // initialize work queue
-        let (work_tx, work_rx) =  bounded::<PieceWork>(pieces.len());
-
-        Ok(Torrent {
-            announce: torrent.announce.unwrap_or_default(),
+        Torrent {
+            metadata: Some(torrent.info),
+            announce: torrent.announce,
             info_hash,
-            pieces: pieces.into(),
-            piece_len: torrent.info.piece_length,
-            file_len: torrent.info.length.unwrap(),
-            name: torrent.info.name,
             bitfield,
-            work_tx,
-            work_rx
-        })
-    }
-}
-
-impl From<Vec<u8>> for Torrent {
-    fn from(bytes: Vec<u8>) -> Self {
-        serde_bencode::from_bytes(&bytes).unwrap()
-    }
-}
-
-pub struct ToChunks<R> {
-    reader: R,
-    chunk_size: usize,
-}
-
-impl<R: Read> Iterator for ToChunks<R> {
-    type Item = IoResult<Vec<u8>>;
-    
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut buffer = vec![0u8; self.chunk_size];
-        match self.reader.read_exact(&mut buffer) {
-            Ok(()) => Some(Ok(buffer)),
-            Err(e) if e.kind() == IoErrorKind::UnexpectedEof => None,
-            Err(e) => Some(Err(e)),
+            piece_trx: None,
+            piece_len: None,
         }
     }
-}
 
-pub trait IterChunks {
-    type Output;
-    
-    fn iter_chunks(self, len: usize) -> Self::Output;
-}
-
-impl<R: Read> IterChunks for R {
-    type Output = ToChunks<R>;
-    
-    fn iter_chunks(self, len: usize) -> Self::Output {
-        ToChunks {
-            reader: self,
-            chunk_size: len,
+    pub fn from_info_hash(bytes: [u8; 20])  -> Self {
+        Torrent {
+            metadata: None,
+            announce: None,
+            info_hash: bytes,
+            bitfield: BitVec::default(),
+            piece_trx: None,
+            piece_len: None,
         }
     }
-}
 
-fn build_query_string<'a, I>(pairs: I) -> String 
-where I: IntoIterator<Item = (&'a str, &'a str)> {
-    pairs.into_iter()
-        .map(|(key, value)| format!("{}={}", key, value))
-        .collect::<Vec<String>>()
-        .join("&")
-}
-
-impl Torrent {
     fn build_tracker_url(&self, peer_id: &[u8; 20], port: i64) -> String {
+        let torrent = self.metadata.as_ref().unwrap();
 
         // represent binary data as url-encoded strings
         let info_hash = percent_encode(&self.info_hash, NON_ALPHANUMERIC);
         let peer_id = percent_encode(peer_id, NON_ALPHANUMERIC);
 
-        let query = build_query_string([
+        let query = [
             ("compact", "1"),
             ("downloaded", "0"),
             ("info_hash", &info_hash.to_string()),
-            ("left", &self.file_len.to_string()),
+            ("left", &torrent.length.unwrap().to_string()),
             ("peer_id", &peer_id.to_string()),
             ("port", &port.to_string()),
             ("uploaded", "0"),
-        ]);
+        ]
+            .into_iter()
+            .map(|(key, value)| format!("{}={}", key, value))
+            .collect::<Vec<String>>()
+            .join("&");
 
-        format!("{}?{}", self.announce, query)
+        format!("{}?{}", self.announce.as_ref().unwrap(), query)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-        pub async fn request_peers(&self) -> impl futures::stream::Stream<Item = impl futures::Future<Output = IoResult<impl AsyncRead + AsyncWrite + Unpin>>> {
+        pub async fn request_peers(&self) -> impl futures::stream::Stream<Item = impl futures::Future<Output = IoResult<impl AsyncRead + AsyncWrite + Debug>>> {
         // identifies the file we want to download
         let tracker_url = self.build_tracker_url(&PEER_ID, 8080);
         // announce our presence to the tracker, TODO: don't use unwrap here
@@ -305,112 +300,289 @@ impl Torrent {
         }))
     }
 
-    pub fn init_state<R: Read>(&mut self, file: &mut R) -> IoResult<()> {
-        let mut file_pieces = file.iter_chunks(self.piece_len as usize);
+    pub async fn start(
+        self, 
+        peers: impl futures::stream::Stream<Item = impl futures::Future<Output = IoResult<impl AsyncWrite + AsyncRead + Unpin + Debug>>>,
+        tasks: &[Task],
+        file: impl AsyncRead + AsyncWrite + AsyncSeek + Unpin,
+    ) {
 
-        for (i, &piece_hash) in self.pieces.iter().enumerate() {
-            if let Some(file_piece) = file_pieces.next() {
-                let file_piece_hash: [u8; 20] = Sha1::digest(file_piece?).into();
-                if file_piece_hash == piece_hash {
-                    // add piece to our bitfield
-                    self.bitfield.set(i, true);
-                    continue;
+        // setup global state
+        let state = Rc::new(RefCell::new(self));
+
+        let (tx_task, rx_task) = tokio::sync::watch::channel(tasks.to_vec());
+        let tx_task_ref = &tx_task;
+
+        let file = Rc::new(Mutex::new(file));
+
+        peers.for_each_concurrent(None, |peer_fut| {
+            let rx_task = rx_task.clone();
+            let tx_task = tx_task_ref.clone();
+            let state = state.clone();
+            let file = file.clone();
+            async move {
+                if let Ok(mut peer) = peer_fut.await {
+                    Torrent::handle_peer(&mut peer, rx_task, tx_task, state, file).await
+                        .unwrap_or_else(|err | {
+                            warn!("Disconnecting from peer with error: {:?}", err);
+                        });
                 }
             }
-            // add piece as work item
-            let begin = (i as i64) * self.piece_len;
-            let piece_len = (begin+self.piece_len).min(self.file_len) - begin;
-            self.work_tx.send(PieceWork {
-                index: i,
-                hash: piece_hash,
-                len: piece_len as u32,
-            }).expect("Unable to fill work queue");
-        }
-
-        Ok(())
-
-    }
-
-    pub async fn download<W: AsyncWrite + AsyncSeek + Unpin>(mut self, file: &mut W, peers: impl futures::stream::Stream<Item = impl futures::Future<Output = IoResult<impl AsyncRead + AsyncWrite + Unpin>>>) -> IoResult<()> {
-        info!("Starting download for {}", self.name);
-
-        if self.work_tx.is_empty() {
-            // fill work queue
-            for (i, &piece_hash) in self.pieces.iter().enumerate() {
-                let begin = (i as i64) * self.piece_len;
-                let piece_len = (begin+self.piece_len).min(self.file_len) - begin;
-                self.work_tx.send(PieceWork {
-                    index: i,
-                    hash: piece_hash,
-                    len: piece_len as u32,
-                }).expect("Unable to fill work queue");
-            }
-        }
-        
-        // store the result in a multi-producer, single-consumer queue
-        let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<PieceResult>(self.pieces.len());
-
-        // a multi-producer, multi-consumer queue with specified capacity
-        let (work_tx, work_rx) = (&self.work_tx, &self.work_rx);
-        
-        // counter for number of active peers
-        let num_peers= Rc::new(Mutex::new(0));
-
-        let workers = peers.for_each_concurrent(None, |f| {
-            enclose! { (work_tx, work_rx, result_tx, num_peers) async move {
-                if let Ok(peer) = f.await {
-                    *num_peers.lock().unwrap() += 1;
-                    if let Err(e) = start_download_task(peer, work_tx, work_rx, result_tx, &self.info_hash).await {
-                        info!("Disconnecting from peer with error: {:?}", e);
-                        *num_peers.lock().unwrap() -= 1;
-                    } else {
-                        info!("Done with download task");
-                    }
-                }
-            } }
-        }).boxed_local();
-
-        let mut downloaded_pieces = self.bitfield.iter().fold(0, |acc, x| acc + x as usize);
-
-        // collect download results
-        let result = async {
-            while downloaded_pieces < self.pieces.len() {
-                let res = result_rx.recv().await.unwrap();
-                let begin = (res.index as i64) * self.piece_len;
-                file.seek(SeekFrom::Start(begin as u64)).await.unwrap();
-                file.write_all(&res.buf).await.unwrap();
-                downloaded_pieces += 1;
-                let percent = (downloaded_pieces as f64 / self.pieces.len() as f64) * 100.0;
-                info!("({:.2}%) Downloaded piece #{:?} from {:?} peers", percent, res.index, *num_peers.lock().unwrap());
-                self.bitfield.set(res.index, true);
-            }
-            info!("done with download for {:?}", self.name);
-        }.boxed_local();
-
-        // wait for either one of two futures to complete.
-        futures::future::select(workers, result).await;
-
-        Ok(())
-    }
-
-    pub async fn seed<R: Read + Seek + Send>(mut self, file: R, peers: impl futures::stream::Stream<Item = impl futures::Future<Output = IoResult<impl AsyncRead + AsyncWrite + Unpin>>>) {
-        let file = Arc::new(Mutex::new(file));
-
-        // assume the file is complete
-        self.bitfield.set_all();
-        let bitfield = &self.bitfield;
-
-        peers.for_each_concurrent(None, |peer| {
-            enclose! { (file) async move {
-                if let Ok(peer) = peer.await {
-                    if let Err(e) = start_upload_task(peer, self.piece_len, &self.info_hash, &bitfield, file).await {
-                        info!("error: {:?}", e.to_string());
-                    }
-                }
-            } }
         }).await;
+
     }
 
+    pub async fn handle_peer(
+        mut peer: impl AsyncWrite + AsyncRead + Unpin + Debug,
+        mut rx_task: tokio::sync::watch::Receiver<Vec<Task>>,
+        tx_task: &tokio::sync::watch::Sender<Vec<Task>>,
+        state: Rc<RefCell<Torrent>>,
+        file: Rc<Mutex<impl AsyncRead + AsyncWrite + AsyncSeek + Unpin>>
+    ) -> Result<(), LocatedError<Box<dyn std::error::Error>>> {
+        let info_hash = state.borrow().info_hash;
+        // setup local state
+        let mut ps = PeerState { bitfield: BitVec::default(), choked: true, metadata_size: 0, message_id: 0 };
+
+        // handshake
+        let req = Handshake {
+            len: 19,
+            protocol: b"BitTorrent protocol".to_owned(),
+            reserved: [0, 0, 0, 0, 0, 0x10, 0, 0],
+            info_hash,
+            peer_id: *PEER_ID,
+        };
+
+        let mut bytes = bincode::serialize(&req)?;
+        peer.write_all(&bytes).await?;
+        peer.read_exact(&mut bytes).await?;
+        let res: Handshake = bincode::deserialize(&bytes)?;
+
+        // verify info hash
+        if res.info_hash != info_hash {
+            panic!("invalid infohash")
+        }
+
+        #[derive(Debug, Deserialize, Serialize)]
+        struct ExtHandshake {
+            m: HashMap<String, i32>,
+            metadata_size: Option<u32>
+        }
+
+        let req = ExtHandshake {
+            m: HashMap::from([("ut_metadata".to_owned(), 1)]),
+            metadata_size: None,
+        };
+        let mut bytes = serde_bencode::to_bytes(&req)?;
+        bytes.insert(0, 0u8);
+        send_message(&mut peer, opcode::EXTENDED, Some(bytes)).await?;
+
+        let msg = Message::read(&mut peer, &[opcode::EXTENDED], &mut ps).await?;
+        let (&id, payload) = msg.payload.split_first().unwrap();
+
+        if id != 0u8 {
+            return Err(LocatedError::from(std::io::Error::new(std::io::ErrorKind::Other, "wrong id")));
+        }
+        let res: ExtHandshake = serde_bencode::from_bytes(&payload)?;
+        ps.metadata_size = res.metadata_size.unwrap() as usize;
+        ps.message_id = res.m["ut_metadata"] as u8;
+
+        // complete tasks
+        while let Some(current_task) = { let x = rx_task.borrow_and_update().first().map(|x| x.clone()); x } {
+            match current_task {
+                Task::DownloadMetadata => {
+                    tokio::select! {
+                        biased;
+                        _ = rx_task.changed() => {}
+                        metadata = async {
+                            // move this code to function
+                            const METADATA_PIECE_LEN: usize = 16384;
+                            let mut metadata = vec![0u8; ps.metadata_size];
+
+                            // request pieces
+                            let num_pieces = ps.metadata_size.div_ceil(METADATA_PIECE_LEN);
+                            for i in 0..num_pieces {
+                                let req = ExtMsg {
+                                    msg_type: 0, piece: i as i32, total_size: None
+                                };
+                                let mut bytes = serde_bencode::to_bytes(&req).unwrap();
+                                bytes.insert(0, ps.message_id);
+                                send_message(&mut peer, opcode::EXTENDED, Some(bytes)).await.unwrap();
+
+                                let msg = Message::read(&mut peer, &[opcode::EXTENDED], &mut ps).await.unwrap();
+                                let (_id, payload) = msg.payload.split_first().unwrap();
+
+                                let data: ExtMsg = serde_bencode::from_bytes(&payload).unwrap();
+                                let begin = (data.piece as usize) * METADATA_PIECE_LEN;
+                                let end = (begin + METADATA_PIECE_LEN).min(ps.metadata_size) - begin;
+
+                                metadata[begin..begin+end].clone_from_slice(&msg.payload[msg.payload.len()-end..]);
+                            }
+
+                            metadata
+
+                        } => {
+                            if Sha1::digest(&metadata).as_slice() != info_hash {
+                                return Err(LocatedError::from(std::io::Error::new(std::io::ErrorKind::Other, "invalid info hash")));
+                            }
+                            let torrent: BencodeInfo = serde_bencode::from_bytes(&metadata)?;
+                            let mut state = state.borrow_mut();
+                            state.metadata = Some(torrent);
+                            tx_task.send_modify(|tasks| { tasks.remove(0); });
+                        }
+                    }
+                }
+
+                Task::EnqueuePieces => {
+                    // this is done synchronous, so there should not be any interleaving
+                    let mut state = state.borrow_mut();
+                    let torrent: &BencodeInfo = state.metadata.as_ref().expect("Unable to enqueue pieces without metadata");
+                    // split pieces into slice of hashes where each slice is 20 bytes
+                    let pieces: &[[u8; 20]] = torrent.pieces.as_chunks().0;
+                    let (piece_tx, piece_rx) = crossbeam_channel::bounded(pieces.len());
+                    for (i, &piece_hash) in pieces.iter().enumerate() {
+                        let begin = (i as i64) * torrent.piece_len;
+                        let piece_len = (begin + torrent.piece_len).min(torrent.length.unwrap()) - begin;
+                        piece_tx.send(PieceWork {
+                            index: i,
+                            hash: piece_hash,
+                            len: piece_len as u32,
+                        })?;
+                    }
+                    state.piece_len = Some(torrent.piece_len); // remove?
+                    state.piece_trx = Some((piece_tx, piece_rx));
+                    
+                    tx_task.send_modify(|tasks| { tasks.remove(0); });
+                }
+
+                Task::DownloadPieces => {
+                    if ps.bitfield.is_empty() {
+                        Message::read(&mut peer, &[opcode::BITFIELD], &mut ps).await?;
+                    }
+
+                    let state = state.borrow();
+                    // assume the work queue has been filled
+                    let (piece_tx, piece_rx) = state.piece_trx.as_ref().expect("No pieces are enqueued");
+
+                    send_message(&mut peer, opcode::UNCHOKE, None).await?; // this should be done on demand instead
+                    send_message(&mut peer, opcode::INTEREST, None).await?;
+
+                    while let Ok(pw) = piece_rx.try_recv() {
+                        if !ps.bitfield[pw.index] {
+                            piece_tx.send(pw)?;
+                            continue;
+                        }
+
+                        let buf = match attempt_download_piece(&mut peer, &mut ps, &pw).await {
+                            Ok(buf) => buf,
+                            Err(error) => {
+                                piece_tx.send(pw)?;
+                                return Err(LocatedError::from(std::io::Error::new(std::io::ErrorKind::Other, error.to_string())));
+                                
+                            }
+                        };
+                       
+                        // check integrity of the piece
+                        let hash: [u8; 20] = Sha1::digest(&buf).into();
+                        if hash != pw.hash {
+                            piece_tx.send(pw)?;
+                            panic!("hash does not match");
+                        }
+
+                        // notify peer that we have the piece
+                        send_message(&mut peer, opcode::HAVE, Some((pw.index as u32).to_be_bytes().to_vec())).await?;
+                        {
+                            let mut file = file.lock().await;
+                            file.seek(SeekFrom::Start(pw.index as u64)).await.unwrap();
+                            file.write_all(&buf).await.unwrap();
+                            let percent = (1.0 - (piece_rx.len() as f64 / piece_rx.capacity().unwrap() as f64)) * 100.0;
+                            info!("({:.2}%) Downloaded piece #{:?} from {:?} peers", percent, pw.index, tx_task.receiver_count());
+                        }
+                    }
+
+                    if !rx_task.has_changed()? {
+                        tx_task.send_modify(|tasks| { tasks.remove(0); });
+                    }
+                }
+
+                Task::SeedPieces => {
+                    send_message(&mut peer, opcode::BITFIELD, Some(ps.bitfield.to_bytes())).await?;
+                    send_message(&mut peer, opcode::UNCHOKE, None).await?;
+                    let piece_len = state.borrow().piece_len.unwrap();
+                    loop {
+                        let msg = Message::read(&mut peer, &[opcode::REQUEST], &mut ps).await?;
+                        let pr: PieceRequest = bincode::DefaultOptions::new()
+                            .with_big_endian()
+                            .with_fixint_encoding()
+                            .deserialize(&msg.payload)?;
+                        
+                        let begin = (pr.index * piece_len as u32) + pr.requested;
+                        let mut buf = vec![0u8; pr.len as usize];
+                        {
+                            let mut file = file.lock().await;
+                            file.seek(SeekFrom::Start(begin as u64)).await?;
+                            file.read_exact(&mut buf).await?;
+                        }
+                        send_message(&mut peer, opcode::PIECE, Some([
+                            &pr.index.to_be_bytes(),
+                            &pr.requested.to_be_bytes(),
+                            buf.as_slice(),
+                        ].concat())).await?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+async fn attempt_download_piece(mut peer: impl AsyncRead + AsyncWrite + Unpin, ps: &mut PeerState, pw: &PieceWork) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut buf = vec![0u8; pw.len as usize];
+    const MAX_BACKLOG: i32 = 5;
+    const MAX_BLOCKSIZE: u32 = 16384;
+    let mut downloaded = 0;
+    let mut backlog = 0;
+    let mut requested = 0;
+
+    while downloaded < pw.len {
+        if !ps.choked {
+            // send requests untill we have enough unfulfilled requests (this should be done in send_message instead)
+            while backlog < MAX_BACKLOG && requested < pw.len {
+                // last block might be shorter than the max blocksize
+                let blocksize = pw.len.min(requested + MAX_BLOCKSIZE) - requested;
+                send_message(&mut peer, opcode::REQUEST, Some([
+                    (pw.index as u32).to_be_bytes(),
+                    requested.to_be_bytes(),
+                    blocksize.to_be_bytes(),
+                ].concat())).await?;
+
+                backlog += 1;
+                requested += blocksize;
+            }
+        }
+
+        // read message
+        let msg = Message::read(&mut peer, &[opcode::PIECE, opcode::CHOKE, opcode::UNCHOKE, opcode::HAVE], ps).await?;
+        if msg.id == opcode::PIECE {
+            let index = u32::from_be_bytes(msg.payload[..4].try_into()?);
+            if index as usize != pw.index {
+                return Err(format!("Expected index {}, got {}", index, pw.index).into());
+            }
+            let begin = u32::from_be_bytes(msg.payload[4..8].try_into()?) as usize;
+            if begin > buf.len() {
+                return Err("Begin offset to high".into());
+            }
+            let data = &msg.payload[8..];
+            if begin + data.len() > buf.len() {
+                return Err(format!("Data to long ({}) for offset {} with len {}", data.len(), begin, buf.len()).into());
+            }
+            buf[begin..begin+data.len()].clone_from_slice(data);
+            downloaded += data.len() as u32;
+            backlog -= 1;
+        }
+    }
+
+    Ok(buf)
 }
 
 #[derive(Debug, Deserialize)]
@@ -421,7 +593,7 @@ struct BencodeTrackerResp {
 // const PEER_ID: &[u8; 20] = b"wasmtorrent-12345678";
 
 lazy_static! {
-    /// This is an random id generated once at runtime
+    /// This is a random id generated once at runtime
     static ref PEER_ID: [u8; 20] = {
         rand::Rng::sample_iter(rand::thread_rng(), &rand::distributions::Alphanumeric)
                 .take(20)
@@ -429,19 +601,7 @@ lazy_static! {
     };
 }
 
-impl Handshake {
-    fn new(info_hash: &[u8; 20]) -> Handshake {
-        Handshake {
-            len: 19,
-            protocol: b"BitTorrent protocol".to_owned(),
-            reserved: [0u8; 8],
-            info_hash: *info_hash, 
-            peer_id: *PEER_ID,
-        }
-    }
-}
-
-mod btid {
+mod opcode {
     pub const CHOKE: u8 = 0;
     pub const UNCHOKE: u8 = 1;
     pub const INTEREST: u8 = 2;
@@ -451,6 +611,8 @@ mod btid {
     pub const REQUEST: u8 = 6;
     pub const PIECE: u8 = 7;
     pub const CANCEL: u8 = 8;
+
+    pub const EXTENDED: u8 = 20;
 }
 
 impl Message {
@@ -463,24 +625,28 @@ impl Message {
         Ok(())
     }
 
-    async fn read<R: AsyncRead + Unpin>(reader: &mut R) -> IoResult<Option<Self>>
+    async fn read<R: AsyncRead + Unpin>(reader: &mut R, listen: &[u8], state: &mut PeerState) -> IoResult<Self>
     {
-        let len = reader.read_u32().await?;
+        loop {
+            let len = reader.read_u32().await?;
+            if len == 0 {
+                // keep-alive message
+                continue
+            }
 
-        // keep-alive message
-        if len == 0 {
-            return Ok(None);
+            let mut buf = vec![0u8; len as usize];
+            reader.read_exact(&mut buf).await?;
+            let (&id, payload) = buf.split_first().unwrap();
+            match id {
+                opcode::CHOKE => state.choked = true,
+                opcode::UNCHOKE => state.choked = false,
+                opcode::BITFIELD => state.bitfield = BitVec::from_bytes(payload),
+                _ => {}
+            }
+            if listen.contains(&id) {
+                return Ok(Message { id, payload: payload.to_vec() })
+            }
         }
-
-        let mut buf = vec![0u8; len as usize];
-        reader.read_exact(&mut buf).await?;
-
-        Ok(
-            Some(Message {
-                id: buf[0],
-                payload: buf[1..].to_vec(),
-            })
-        )
     }
 }
 
@@ -491,214 +657,6 @@ async fn send_message<W: AsyncWrite + Unpin>(peer: &mut W, id: u8, payload: Opti
     };
     debug!("sending {:?}", msg);
     msg.serialize(peer).await
-}
-
-pub async fn start_download_task<A: AsyncRead + AsyncWriteExt + Unpin>(
-    mut peer: A, 
-    work_tx: Sender<PieceWork>, 
-    work_rx: Receiver<PieceWork>, 
-    result_tx: tokio::sync::mpsc::Sender<PieceResult>, 
-    info_hash: &[u8; 20]
-) -> Result<(), Box<dyn std::error::Error>> {
-
-    // send handshake
-    let req = Handshake::new(info_hash);
-    let mut bytes = bincode::serialize(&req).unwrap();
-    peer.write_all(&bytes).await.unwrap();
-
-    // recieve handshake
-    peer.read_exact(&mut bytes).await?;
-    let res: Handshake = bincode::deserialize(&bytes).unwrap();
-
-    // verify infohash
-    if res.info_hash != *info_hash {
-        return Err(bincode::ErrorKind::Custom("invalid info hash".to_string()).into());
-    }
-
-    // receive bitfield
-    let res = Message::read(&mut peer).await?.unwrap();
-    if res.id != btid::BITFIELD {
-        let error_message = format!("Expected bitfield but got {:?}", res.id);
-        return Err(bincode::ErrorKind::Custom(error_message).into());
-    }
-
-    let mut bitfield = BitVec::from_bytes(&res.payload);
-    let mut choked = true;
-
-    send_message(&mut peer, btid::UNCHOKE, None).await?;
-    send_message(&mut peer, btid::INTEREST, None).await?;
-
-    while let Ok(pw) = work_rx.try_recv() {
-        if !bitfield[pw.index] {
-            work_tx.send(pw)?; // put piece back on the queue
-            continue;
-        }
-
-        // Download the piece
-        let buf = match attempt_download_piece(&mut peer, &mut choked, &mut bitfield, &pw).await {
-            Ok(buf) => buf,
-            Err(error) => {
-                work_tx.send(pw)?;
-                error!("Failed to download piece {:?}, Exiting", error);
-                return Err(error);
-            }
-        };
-        
-        // check integrity of the piece
-        let hash: [u8; 20] = Sha1::digest(&buf).into();
-        if hash != pw.hash {
-            work_tx.send(pw)?;
-            error!("hashes do not match");
-            continue;
-        }
-
-        // notify peer that we have the piece
-        send_message(&mut peer, btid::HAVE, Some((pw.index as u32).to_be_bytes().to_vec())).await?;
-        
-        // add piece to result
-        result_tx.send(PieceResult { buf, index: pw.index }).await?;
-    }
-    Ok(())
-
-}
-
-async fn attempt_download_piece<A: AsyncRead + AsyncWrite + Unpin>(peer: &mut A, choked: &mut bool, bitfield: &mut BitVec, pw: &PieceWork) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    const MAX_BACKLOG: i32 = 5;
-    const MAX_BLOCKSIZE: u32 = 16384;
-
-    let mut downloaded = 0;
-    let mut backlog = 0;
-    let mut requested = 0;
-
-    let mut buf =  vec![0u8; pw.len as usize]; 
-
-    while downloaded < pw.len {
-        if !*choked {
-            // if unchoked, send requests untill we have enough unfulfilled requests
-            while backlog < MAX_BACKLOG && requested < pw.len {
-                // Last block might be shorter than the max blocksize
-                let blocksize = pw.len.min(requested+MAX_BLOCKSIZE) - requested;
-
-                send_message(peer, btid::REQUEST, Some([
-                    (pw.index as u32).to_be_bytes(), 
-                    requested.to_be_bytes(), 
-                    blocksize.to_be_bytes()
-                ].concat())).await?;
-
-                backlog += 1;
-                requested += blocksize;
-            }
-        }
-
-        // read message
-        let msg = Message::read(peer).await?;
-        if msg == None {
-            // keep-alive
-            continue;
-        }
-        let msg = msg.unwrap();
-        match msg.id {
-            btid::CHOKE => { 
-                *choked = true; 
-            },
-            btid::UNCHOKE => { 
-                *choked = false; 
-            },
-            btid::HAVE => {
-                let index = u32::from_be_bytes(msg.payload.try_into().unwrap());
-                bitfield.set(index as usize, true);
-            },
-            btid::PIECE => {
-                let index = u32::from_be_bytes(msg.payload[..4].try_into().unwrap());
-                // compare both index
-                if index as usize != pw.index {
-                    return Err(format!("Expected index {}, got {}", index, pw.index).into());
-                }
-                let begin = u32::from_be_bytes(msg.payload[4..8].try_into().unwrap()) as usize;
-                if begin > buf.len() {
-                    return Err("Begin offset to high".into());
-                }
-                let data = &msg.payload[8..];
-                if begin + data.len() > buf.len() {
-                    return Err(format!("Data too long [{}] for offset {} with len {}", data.len(), begin, buf.len()).into());
-                }
-                buf[begin..begin+data.len()].clone_from_slice(data);
-                downloaded += data.len() as u32;
-                backlog -= 1;
-            },
-            _ => panic!("unexpected message: {:?}", msg.id)
-        };
-    }
-
-    Ok(buf)
-}
-
-async fn start_upload_task<R: Read + Seek, A: AsyncRead + AsyncWriteExt + Unpin>(
-    mut peer: A, 
-    piece_len: i64, 
-    info_hash: &[u8; 20], 
-    bitfield: &BitVec, 
-    file: Arc<Mutex<R>>
-) -> Result<(), Box<dyn std::error::Error>> {
-
-    // recieve handshake
-    let mut buf = vec![0; 68];
-    peer.read_exact(&mut buf).await?;
-    let res: Handshake = bincode::deserialize(&buf).unwrap();
-    
-    // verify infohash
-    if res.info_hash != *info_hash {
-        return Err(bincode::ErrorKind::Custom("invalid info hash".to_string()).into());
-    }
-    
-    // send handshake
-    let req = Handshake::new(info_hash);
-    let bytes = bincode::serialize(&req).unwrap();
-    peer.write_all(&bytes).await.unwrap();
-
-    // send bitfield
-    info!("sending bitfield");
-    send_message(&mut peer, btid::BITFIELD, Some(bitfield.to_bytes())).await?;
-
-    // send unchoke
-    info!("sending unchoke");
-    send_message(&mut peer, btid::UNCHOKE, None).await?;
-
-    // wait for client to request piece
-    loop {
-        let msg = match Message::read(&mut peer).await {
-            Ok(Some(msg)) => msg,
-            Ok(None) => continue,
-            Err(_) => break,
-        };
-
-        info!("new message: {:?}", msg);
-
-        match msg.id {
-            btid::REQUEST => {
-                let pr: PieceRequest = bincode::DefaultOptions::new()
-                    .with_big_endian()
-                    .with_fixint_encoding()
-                    .deserialize(&msg.payload)?;
-
-                let begin = (pr.index * piece_len as u32) + pr.requested;
-                let mut buf = vec![0u8; pr.len as usize];
-                {
-                    let mut file = file.lock().unwrap();
-                    file.seek(std::io::SeekFrom::Start(begin as u64))?;
-                    file.read_exact(&mut buf)?;
-                }
-                send_message(&mut peer, btid::PIECE, Some([
-                    &pr.index.to_be_bytes(),
-                    &pr.requested.to_be_bytes(),
-                    buf.as_slice(),
-                ].concat())).await?;
-            }
-            _ => continue
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -767,7 +725,7 @@ mod tests {
         let mut input: &[u8] = &[0, 0, 0, 5, 4, 1, 2, 3, 4];
         let msg = Message::read(&mut input).unwrap();
         assert_eq!(msg, Some(Message {
-            id: btid::HAVE,
+            id: opcode::HAVE,
             payload: [1,2,3,4].to_vec(),
         }));
 
@@ -781,7 +739,7 @@ mod tests {
         let msg = Message::read(&mut input).unwrap().unwrap();
 
         assert_eq!(msg, Message {
-            id: btid::UNCHOKE,
+            id: opcode::UNCHOKE,
             payload: vec![],
         });
     }

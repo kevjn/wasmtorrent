@@ -1,13 +1,10 @@
-use std::{io::{Result as IoResult}, net::ToSocketAddrs};
-
-use futures::{stream::{self, Stream}, StreamExt};
+use std::io::Result as IoResult;
 use tokio::fs::OpenOptions;
-use wasmtorrent::Torrent;
+use wasmtorrent::{Torrent, Task};
 
 #[tokio::main]
 async fn main() -> IoResult<()> {
     tracing_subscriber::fmt()
-        .with_thread_ids(true)
         .with_line_number(true)
         .without_time()
         .init();
@@ -15,21 +12,18 @@ async fn main() -> IoResult<()> {
     let args = std::env::args().collect::<Vec<String>>();
     let filename = args.get(1).expect("no torrent file specified");
     let bytes = tokio::fs::read(filename).await?;
-    let mut torrent = Torrent::from(bytes);
+
+    // from file
+    let torrent = Torrent::from_torrent_file(bytes);
     
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
-        .open(&torrent.name).await?;
+        .open(&torrent.metadata.as_ref().unwrap().name).await?;
     
     let peers = torrent.request_peers().await;
-
-    // torrent.init_state(&mut file)?;
-
-    torrent.download(&mut file, peers).await?;
-
-    // torrent.seed(file, "0.0.0.0:8080".parse().unwrap())?;
+    torrent.start(peers, &[Task::EnqueuePieces, Task::DownloadPieces], file).await;
 
     Ok(())
 }
