@@ -1,6 +1,6 @@
 use std::io::Result as IoResult;
 use tokio::fs::OpenOptions;
-use wasmtorrent::{Torrent, Task};
+use wasmtorrent::Torrent;
 
 #[tokio::main]
 async fn main() -> IoResult<()> {
@@ -16,14 +16,19 @@ async fn main() -> IoResult<()> {
     // from file
     let torrent = Torrent::from_torrent_file(bytes);
     
-    let file = OpenOptions::new()
+    let mut file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .open(&torrent.metadata.as_ref().unwrap().name).await?;
+
+    // let torrent = Torrent::from_info_hash(torrent.info_hash);
     
-    let peers = torrent.request_peers().await;
-    torrent.start(peers, &[Task::EnqueuePieces, Task::DownloadPieces], file).await;
+    let mut peers = torrent.request_peers().await;
+    // let metadata = torrent.download_metadata(&mut peers).await;
+    let (tx, rx) = torrent.enqueue_pieces(Some(&mut file)).await;
+    torrent.download_pieces(&mut peers, &mut file, tx, rx).await;
+    // torrent.seed_pieces(&mut peers, &mut file).await;
 
     Ok(())
 }
