@@ -3,6 +3,8 @@
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use futures::StreamExt;
+use futures::FutureExt;
+use futures::TryFutureExt;
 
 #[wasm_bindgen(start)]
 pub fn run() -> Result<(), JsValue> {
@@ -16,62 +18,52 @@ extern {
 }
 
 #[wasm_bindgen]
-pub async fn seed(metainfo: Vec<u8>, peers: Vec<web_sys::RtcDataChannel>, upload: Vec<u8>, socket: web_sys::EventTarget) {
-    let torrent = wasmtorrent::Torrent::from(metainfo);
-    let upload = std::io::Cursor::new(upload);
-    let peers = futures::stream::iter(peers.into_iter().map(|peer| futures::future::ok(wasmtorrent::DataStream::new(peer))));
+pub async fn seed(metainfo: Vec<u8>, upload: Vec<u8>, socket: web_sys::EventTarget) {
+    let mut torrent = wasmtorrent::Torrent::from_torrent_file(metainfo);
+    let mut upload = std::io::Cursor::new(upload);
 
-    let (mut tx, rx) = futures::channel::mpsc::channel(32);
-    let onpeer = Closure::<dyn FnMut(_)>::new(move |ev: web_sys::CustomEvent| {
-        log::info!("new event: {:?}", ev);
-        let peer = match ev.detail().dyn_into::<web_sys::RtcDataChannel>() {
-            Ok(peer) => {
-                futures::future::ok::<wasmtorrent::DataStream, std::io::Error>(wasmtorrent::DataStream::new(peer))
-            }
-            Err(_) => {
-                panic!("error reading from RtcDataChannel");
-            }
-        };
-        if let Err(e) = tx.try_send(peer) {
-            panic!("Error sending via channel: {:?}", e);
-        }
+    let (mut tx, mut rx) = futures::channel::mpsc::channel(32);
+    let onpeer_callback = Closure::<dyn FnMut(_)>::new(move |ev: web_sys::CustomEvent| {
+        tx.try_send(ev.detail().dyn_into::<web_sys::RtcDataChannel>().unwrap()).unwrap()
     });
-    socket.add_event_listener_with_callback("newPeer", onpeer.as_ref().unchecked_ref()).unwrap();
-    onpeer.forget();
+    socket.add_event_listener_with_callback("newPeer", onpeer_callback.as_ref().unchecked_ref()).unwrap();
+    onpeer_callback.forget();
 
-    let peers = peers.chain(rx);
+    torrent.bitfield.set_all();
+    let info_hash = &torrent.info_hash;
+    let mut peers = async_stream::stream! {
+        loop {
+            let peer = rx.select_next_some().await;
+            yield wasmtorrent::Torrent::handshake(info_hash, wasmtorrent::wasm::DataStream::new(peer))
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, format!("handshake failed with error: {:?}", err))).await;
+        }
+    }.boxed_local();
 
-    torrent.seed_to_connections(upload, rx).await;
+    torrent.seed_pieces(&mut peers, upload).await;
 }
 
 #[wasm_bindgen]
-pub async fn leech(metainfo: Vec<u8>, peers: Vec<web_sys::RtcDataChannel>, socket: web_sys::EventTarget) {
-    let torrent = wasmtorrent::Torrent::from(metainfo);
-    let mut output = std::io::Cursor::new(vec![0u8; torrent.file_len as usize]);
+pub async fn leech(metainfo: Vec<u8>, socket: web_sys::EventTarget) {
+    let torrent = wasmtorrent::Torrent::from_torrent_file(metainfo);
+    let mut output = std::io::Cursor::new(vec![0u8; torrent.metadata.as_ref().unwrap().length.unwrap() as usize]);
 
-    // currently connected peers
-    let peers = futures::stream::iter(peers.into_iter().map(|peer| futures::future::ok(wasmtorrent::DataStream::new(peer))));
-
-    let (mut tx, rx) = futures::channel::mpsc::channel(32);
-    let onpeer = Closure::<dyn FnMut(_)>::new(move |ev: web_sys::CustomEvent| {
-        let peer = match ev.detail().dyn_into::<web_sys::RtcDataChannel>() {
-            Ok(peer) => {
-                futures::future::ok::<wasmtorrent::DataStream, std::io::Error>(wasmtorrent::DataStream::new(peer))
-            }
-            Err(_) => {
-                panic!("error reading from RtcDataChannel");
-            }
-        };
-        if let Err(e) = tx.try_send(peer) {
-            panic!("Error sending via channel: {:?}", e);
-        }
+    let (mut tx, mut rx) = futures::channel::mpsc::channel(32);
+    let onpeer_callback = Closure::<dyn FnMut(_)>::new(move |ev: web_sys::CustomEvent| {
+        tx.try_send(ev.detail().dyn_into::<web_sys::RtcDataChannel>().unwrap()).unwrap()
     });
-    socket.add_event_listener_with_callback("newPeer", onpeer.as_ref().unchecked_ref()).unwrap();
-    onpeer.forget();
+    socket.add_event_listener_with_callback("newPeer", onpeer_callback.as_ref().unchecked_ref()).unwrap();
+    onpeer_callback.forget();
 
-    let peers = peers.chain(rx);
+    let info_hash = &torrent.info_hash;
+    let mut peers = async_stream::stream! {
+        loop {
+            let peer = rx.select_next_some().await;
+            yield wasmtorrent::Torrent::handshake(&info_hash, wasmtorrent::wasm::DataStream::new(peer))
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, format!("handshake failed with error: {:?}", err))).await;
+        }
+    }.boxed_local();
 
-    let filename = torrent.name.clone();
-    torrent.download(&mut output, rx).await.unwrap();
-    download_file(output.get_ref(), &filename);
+    let (tx, rx) = torrent.enqueue_pieces(None).await;
+    torrent.download_pieces(&mut peers, &mut output, tx, rx).await;
+    download_file(output.get_ref(), &torrent.metadata.as_ref().unwrap().name);
 }

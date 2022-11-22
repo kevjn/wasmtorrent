@@ -13,6 +13,8 @@ wasm-bindgen-futures = "0.4.32"
 
 futures = "0.3.21"
 
+async-stream = "0.3.3"
+
 log = "0.4"
 console_log = { version = "0.2", features = ["color"] }
 

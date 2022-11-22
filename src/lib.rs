@@ -39,16 +39,13 @@ macro_rules! enclose {
     };
 }
 
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::{prelude::*, JsCast};
-
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BencodeInfo {
     pieces: ByteBuf,
     #[serde(rename = "piece length")]
     piece_len: i64,
     #[serde(default)]
-    length: Option<i64>,
+    pub length: Option<i64>,
     pub name: String,
     private: Option<u8>,
 }
@@ -111,79 +108,83 @@ struct ExtMsg {
     total_size: Option<i32>,
 }
 
-// wrapper for websys datachannel
 #[cfg(target_arch = "wasm32")]
-pub struct DataStream {
-    inner: web_sys::RtcDataChannel,
-    rx_inbound: futures::channel::mpsc::Receiver<Vec<u8>>,
-}
+pub mod wasm {
+    use wasm_bindgen::{prelude::*, JsCast};
+    use std::task::Poll;
+    use crate::IoResult;
 
-#[cfg(target_arch = "wasm32")]
-impl DataStream {
-    pub fn new(inner: web_sys::RtcDataChannel) -> Self {
-        inner.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
-        let (mut tx, rx_inbound) = futures::channel::mpsc::channel(32);
-        let onmessage = Closure::<dyn FnMut(_)>::new(move |ev: web_sys::MessageEvent| {
-            let data: Vec<u8> = match ev.data().dyn_into::<js_sys::ArrayBuffer>() {
-                Ok(data) => {
-                    let bytes: Vec<u8> = js_sys::Uint8Array::new(&data).to_vec();
-                    bytes
-                }
-                Err(data) => {
-                    panic!("error reading from RtcDataChannel");
-                }
-            };
-            if let Err(e) = tx.try_send(data) {
-                error!("Error sending via channel: {:?}", e);
-            }
-        });
-        inner.add_event_listener_with_callback("message", onmessage.as_ref().unchecked_ref()).unwrap();
-        onmessage.forget();
-        Self { inner, rx_inbound }
+    // wrapper for websys datachannel
+    #[derive(Debug)]
+    pub struct DataStream {
+        inner: web_sys::RtcDataChannel,
+        rx_inbound: futures::channel::mpsc::Receiver<Vec<u8>>,
     }
-}
-
-#[cfg(target_arch = "wasm32")]
-impl tokio::io::AsyncRead for DataStream {
-    fn poll_read(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> Poll<IoResult<()>> {
-        match self.as_mut().rx_inbound.poll_next_unpin(cx) {
-             Poll::Ready(Some(x)) => {
-                buf.put_slice(&x[..]);
-                Poll::Ready(Ok(()))
-             }
-             Poll::Ready(None) => Poll::Ready(Ok(())),
-             Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-impl tokio::io::AsyncWrite for DataStream {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        match self.as_ref().inner.send_with_u8_array(buf) {
-            Ok(()) => {
-                Poll::Ready(Ok(buf.len()))
-            }
-            Err(e) => {
-                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))
-            }
+    
+    impl DataStream {
+        pub fn new(inner: web_sys::RtcDataChannel) -> Self {
+            inner.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
+            let (mut tx, rx_inbound) = futures::channel::mpsc::channel(32);
+            let onmessage = Closure::<dyn FnMut(_)>::new(move |ev: web_sys::MessageEvent| {
+                let data: Vec<u8> = match ev.data().dyn_into::<js_sys::ArrayBuffer>() {
+                    Ok(data) => {
+                        let bytes: Vec<u8> = js_sys::Uint8Array::new(&data).to_vec();
+                        bytes
+                    }
+                    Err(data) => {
+                        panic!("error reading from RtcDataChannel");
+                    }
+                };
+                if let Err(e) = tx.try_send(data) {
+                    error!("Error sending via channel: {:?}", e);
+                }
+            });
+            inner.add_event_listener_with_callback("message", onmessage.as_ref().unchecked_ref()).unwrap();
+            onmessage.forget();
+            Self { inner, rx_inbound }
         }
     }
 
-    fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        Poll::Ready(Ok(()))
+    impl tokio::io::AsyncRead for DataStream {
+        fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<IoResult<()>> {
+            match futures::StreamExt::poll_next_unpin(&mut self.as_mut().rx_inbound, cx) {
+                 Poll::Ready(Some(x)) => {
+                    buf.put_slice(&x[..]);
+                    Poll::Ready(Ok(()))
+                 }
+                 Poll::Ready(None) => Poll::Ready(Ok(())),
+                 Poll::Pending => Poll::Pending,
+            }
+        }
     }
-
-    fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        Poll::Ready(Ok(()))
+    
+    impl tokio::io::AsyncWrite for DataStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            match self.as_ref().inner.send_with_u8_array(buf) {
+                Ok(()) => {
+                    Poll::Ready(Ok(buf.len()))
+                }
+                Err(e) => {
+                    Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))
+                }
+            }
+        }
+    
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
     }
 }
 
@@ -291,14 +292,14 @@ impl Torrent {
             let info_hash = self.info_hash.clone();
             tokio::net::TcpStream::connect(s)
                 .and_then(move |peer| async move { 
-                    let p = Torrent::_handshake(&info_hash, peer).await;
-                    p.map_err(|_err| std::io::Error::new(std::io::ErrorKind::Other, "handshake failed"))
+                    Torrent::handshake(&info_hash, peer).await
+                        .map_err(|_err| std::io::Error::new(std::io::ErrorKind::Other, "handshake failed"))
                 }).boxed_local()
         })
             .collect::<futures::stream::FuturesUnordered<_>>()
     }
 
-    async fn _handshake<A: AsyncWrite + AsyncRead + Unpin + Debug>(
+    pub async fn handshake<A: AsyncWrite + AsyncRead + Unpin + Debug>(
         info_hash: &[u8; 20],
         mut peer: A
     ) -> Result<(PeerState, A), Box<dyn std::error::Error>> {
@@ -393,7 +394,6 @@ impl Torrent {
 
         let mut in_progress_state: Vec<Rc<RefCell<(PeerState, A)>>> = Vec::new();
         let mut in_progress: FuturesUnordered<Pin<Box<dyn Future<Output = _>>>> = FuturesUnordered::new();
-        let info_hash = &self.info_hash;
 
         loop {
             tokio::select! {
@@ -403,11 +403,11 @@ impl Torrent {
 
                     in_progress.push(Box::pin(async move {
                         let (ref mut peer, ref mut state) = *peer.borrow_mut();
-                        Torrent::_download_metadata(info_hash, peer, state).await
+                        Torrent::_download_metadata(&self.info_hash, peer, state).await
                     }))
                 }
                 Some(Ok(metadata)) = in_progress.next() => {
-                    drop(in_progress);
+                    in_progress.clear();
                     for p in in_progress_state {
                         let p = Rc::try_unwrap(p).unwrap().into_inner();
                         peers.push(future::ok(p).boxed_local())
@@ -421,13 +421,13 @@ impl Torrent {
         }
     }
 
-    pub async fn enqueue_pieces(&self, file: Option<&mut (impl AsyncRead + Unpin)>) -> (crossbeam_channel::Sender<PieceWork>, crossbeam_channel::Receiver<PieceWork>) {
+    pub async fn enqueue_pieces(&self, file: Option<Box<dyn AsyncRead + Unpin>>) -> (crossbeam_channel::Sender<PieceWork>, crossbeam_channel::Receiver<PieceWork>) {
         let torrent: &BencodeInfo = self.metadata.as_ref().expect("Unable to enqueue pieces without metadata");
         let pieces: &[[u8; 20]] = torrent.pieces.as_chunks().0;
         let (piece_tx, piece_rx) = crossbeam_channel::bounded(pieces.len());
 
         let mut file_pieces = Vec::new();
-        let mut file_pieces = if let Some(file) = file {
+        let mut file_pieces = if let Some(mut file) = file {
             file.read_to_end(&mut file_pieces).await.unwrap();
             Some(file_pieces.chunks(self.metadata.as_ref().unwrap().piece_len as usize))
         } else {
@@ -503,7 +503,7 @@ impl Torrent {
 
     pub async fn download_pieces<A: AsyncWrite + AsyncRead + Unpin + Debug, F: AsyncWrite + AsyncSeek + Unpin>(
         &self, 
-        peers: &mut FuturesUnordered<Pin<Box<dyn Future<Output = IoResult<(PeerState, A)>>>>>,
+        peers: &mut (impl futures::stream::Stream<Item = IoResult<(PeerState, A)>> + Unpin),
         file: &mut F,
         piece_tx: crossbeam_channel::Sender<PieceWork>,
         piece_rx: crossbeam_channel::Receiver<PieceWork>,
@@ -513,33 +513,33 @@ impl Torrent {
         let mut in_progress: FuturesUnordered<Pin<Box<dyn Future<Output = _>>>> = FuturesUnordered::new();
 
         let piece_len = self.metadata.as_ref().unwrap().piece_len;
+        let mut downloaded_pieces = 0;
         loop {
             tokio::select! {
                 Some(res) = peers.next() => {
-                    if let Ok(peer) = res {
-                        let peer = Rc::new(RefCell::new(peer));
+                    if let Ok(mut peer) = res {
                         let piece_rx = piece_rx.clone();
                         let piece_tx = piece_tx.clone();
                         let result_tx = result_tx.clone();
                         in_progress.push(async move {
-                            let (ref mut state, ref mut peer) = *peer.borrow_mut();
+                            let (ref mut state, ref mut peer) = peer;
                             Torrent::_download_pieces(state, peer, piece_tx, piece_rx, result_tx).await
                         }.boxed_local());
                     } else {
-                        info!("disconnecting from peer {:?}", res)
+                        info!("disconnecting from peer with error: {:?}", res)
                     }
                 }
-                Some(_) = in_progress.next() => {
-                    if in_progress.is_empty() {
-                        return
-                    }
-                }
+                Some(_) = in_progress.next() => {}
                 Some(res) = result_rx.recv() => {
                     let begin = (res.index as i64) * piece_len;
                     file.seek(SeekFrom::Start(begin as u64)).await.unwrap();
                     file.write_all(&res.buf).await.unwrap();
-                    let percent = (1.0 - (piece_rx.len() as f64 / piece_rx.capacity().unwrap() as f64)) * 100.0;
+                    downloaded_pieces += 1;
+                    let percent = (downloaded_pieces as f64 / piece_rx.capacity().unwrap() as f64) * 100.0;
                     info!("({:.2}%) Downloaded piece #{:?} from {:?} peers", percent, res.index, in_progress.len());
+                    if downloaded_pieces == piece_rx.capacity().unwrap() { 
+                        return 
+                    }
                 }
                 else => {
                     panic!("errors")
@@ -553,8 +553,9 @@ impl Torrent {
         peer: &mut A,
         file: Rc<Mutex<F>>,
         piece_len: i64,
+        bitfield: &BitVec,
     ) -> Result<(), Box<dyn Error>>{
-        send_message(peer, opcode::BITFIELD, Some(state.bitfield.to_bytes())).await?;
+        send_message(peer, opcode::BITFIELD, Some(bitfield.to_bytes())).await?;
         send_message(peer, opcode::UNCHOKE, None).await?;
 
         loop {
@@ -581,22 +582,27 @@ impl Torrent {
 
     pub async fn seed_pieces<A: AsyncWrite + AsyncRead + Unpin + Debug, F: AsyncRead + AsyncSeek + Unpin>(
         &self, 
-        mut peers: impl futures::stream::Stream<Item = IoResult<(PeerState, A)>> + Unpin,
-        file: &mut F
+        peers: &mut (impl futures::stream::Stream<Item = IoResult<(PeerState, A)>> + Unpin),
+        file: F
     ) {
         let mut in_progress: FuturesUnordered<Pin<Box<dyn Future<Output = _>>>> = FuturesUnordered::new();
         let piece_len = self.metadata.as_ref().unwrap().piece_len;
         let file = Rc::new(Mutex::new(file));
         loop {
             tokio::select! {
-                Some(Ok((mut state, mut peer))) = peers.next() => {
-                    let file = file.clone();
-                    in_progress.push(async move {
-                        Torrent::_seed_pieces(&mut state, &mut peer, file, piece_len).await
-                    }.boxed_local())
+                Some(res) = peers.next() => {
+                    if let Ok((mut state, mut peer)) = res {
+                        let file = file.clone();
+                        in_progress.push(async move {
+                            Torrent::_seed_pieces(&mut state, &mut peer, file, piece_len, &self.bitfield).await
+                        }.boxed_local())
+                    } else {
+                        info!("disconnecting from peer with error: {:?}", res);
+                    }
                 }
-                Some(_) = in_progress.next() => {
-
+                Some(_) = in_progress.next() => {}
+                else => {
+                    panic!("errors")
                 }
             }
         }
@@ -706,7 +712,9 @@ impl Message {
                 _ => {}
             }
             if listen.contains(&id) {
-                return Ok(Message { id, payload: payload.to_vec() })
+                let msg = Message { id, payload: payload.to_vec() };
+                debug!("reading message: {:?}", msg);
+                return Ok(msg)
             }
         }
     }
