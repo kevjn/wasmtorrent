@@ -21,6 +21,8 @@ lazy_static = "1.4.0"
 futures = "0.3.21"
 tokio = { version = "1", features = ["io-util", "sync", "macros"] }
 
+hex = "0.4.3"
+
 async-trait = "0.1.57"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
