@@ -7,6 +7,7 @@ async fn main() -> IoResult<()> {
     tracing_subscriber::fmt()
         .with_line_number(true)
         .without_time()
+        .with_max_level(tracing::Level::INFO)
         .init();
 
     let args = std::env::args().collect::<Vec<String>>();
@@ -16,19 +17,18 @@ async fn main() -> IoResult<()> {
     // from file
     let torrent = Torrent::from_torrent_file(bytes);
     
+    let meta = torrent.metadata.borrow();
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
-        .open(&torrent.metadata.as_ref().unwrap().name).await?;
+        .open(&meta.as_ref().unwrap().name).await?;
 
-    // let torrent = Torrent::from_info_hash(torrent.info_hash);
-    
-    let mut peers = torrent.request_peers().await;
-    // let metadata = torrent.download_metadata(&mut peers).await;
-    let (tx, rx) = torrent.enqueue_pieces(Some(&mut file)).await;
-    torrent.download_pieces(&mut peers, &mut file, tx, rx).await;
-    // torrent.seed_pieces(&mut peers, &mut file).await;
+    let mut peers = torrent.clone().handshake_stream(torrent.request_peers().await);
+    let piece_queue = torrent.enqueue_pieces(None).await;
+
+    let mut connected_peers = Vec::new();
+    torrent.download_pieces(&mut peers, &mut connected_peers, &mut file, piece_queue).await;
 
     Ok(())
 }

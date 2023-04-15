@@ -21,7 +21,6 @@ use tokio::io::{Result as IoResult};
 use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
 use byteorder::{ByteOrder, BigEndian};
 // use crossbeam_channel::{Sender, Receiver};
-use futures::TryFutureExt;
 
 #[macro_use] 
 extern crate log;
@@ -39,9 +38,9 @@ macro_rules! enclose {
     };
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct BencodeInfo {
-    pieces: ByteBuf,
+    pub pieces: ByteBuf,
     #[serde(rename = "piece length")]
     piece_len: i64,
     #[serde(default)]
@@ -50,7 +49,7 @@ pub struct BencodeInfo {
     private: Option<u8>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BencodeTorrent {
     pub info: BencodeInfo,
     #[serde(default)]
@@ -58,9 +57,9 @@ pub struct BencodeTorrent {
 }
 
 // A flat structure for working with single torrent files
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Torrent {
-    pub metadata: Option<BencodeInfo>,
+    pub metadata: Rc<RefCell<Option<BencodeInfo>>>,
     pub announce: Option<String>,
     pub info_hash: [u8; 20],
     pub bitfield: BitVec,
@@ -101,10 +100,19 @@ struct Handshake {
     peer_id: [u8; 20],
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 struct Message {
     id: u8,
     payload: Vec<u8>,
+}
+
+impl std::fmt::Debug for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("Message")
+            .field("id", &self.id.to_opcode_name())
+            .field("payload", &format!("<payload with {} bytes>", &self.payload.len()))
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -121,10 +129,17 @@ pub mod wasm {
     use crate::IoResult;
 
     // wrapper for websys datachannel
-    #[derive(Debug)]
     pub struct DataStream {
         inner: web_sys::RtcDataChannel,
         rx_inbound: futures::channel::mpsc::Receiver<Vec<u8>>,
+    }
+
+    impl std::fmt::Debug for DataStream {
+        fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.debug_struct("DataStream")
+                .field("peer", &self.inner.label())
+                .finish()
+        }
     }
     
     impl DataStream {
@@ -243,7 +258,7 @@ impl Torrent {
         let bitfield = BitVec::from_elem(pieces.len(), false);
 
         Torrent {
-            metadata: Some(torrent.info),
+            metadata: Rc::new(RefCell::new(Some(torrent.info))),
             announce: torrent.announce,
             info_hash,
             bitfield,
@@ -263,7 +278,7 @@ impl Torrent {
         let bitfield = BitVec::from_elem(pieces.len(), false);
 
         Torrent {
-            metadata: Some(info),
+            metadata: Rc::new(RefCell::new(Some(info))),
             announce: None,
             info_hash,
             bitfield,
@@ -272,7 +287,7 @@ impl Torrent {
 
     pub fn from_info_hash(bytes: [u8; 20])  -> Self {
         Torrent {
-            metadata: None,
+            metadata: Rc::new(RefCell::new(None)),
             announce: None,
             info_hash: bytes,
             bitfield: BitVec::default(),
@@ -289,8 +304,33 @@ impl Torrent {
         panic!("invalid magnet link")
     }
 
+    pub fn from_file(filename: String, file: Vec<u8>) -> Self {
+        const PIECE_LEN: usize = 262144;
+
+        let pieces = file.chunks(PIECE_LEN).flat_map(|x| -> [u8;20] {
+             Sha1::digest(x).into() 
+        }).collect::<Vec<u8>>();
+
+        let pieces = serde_bytes::ByteBuf::from(pieces);
+
+        let torrent = BencodeTorrent {
+            info: BencodeInfo { 
+                pieces, 
+                piece_len: PIECE_LEN as i64, 
+                length: Some(file.len() as i64), 
+                name: filename, 
+                private: None 
+            },
+            announce: None
+        };
+
+        let bytes = serde_bencode::to_bytes(&torrent).unwrap();
+        Self::from_torrent_file(bytes)
+    }
+
     fn build_tracker_url(&self, peer_id: &[u8; 20], port: i64) -> String {
-        let torrent = self.metadata.as_ref().unwrap();
+        let metadata = self.metadata.borrow();
+        let torrent = metadata.as_ref().unwrap();
 
         // represent binary data as url-encoded strings
         let info_hash = percent_encode(&self.info_hash, NON_ALPHANUMERIC);
@@ -318,7 +358,7 @@ impl Torrent {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub async fn request_peers(&self) -> FuturesUnordered<Pin<Box<dyn Future<Output = IoResult<(PeerState, impl AsyncRead + AsyncWrite + Debug)>> + 'static>>> {
+    pub async fn request_peers(&self) -> FuturesUnordered<Pin<Box<dyn Future<Output = IoResult<(impl AsyncRead + AsyncWrite + Debug)>> + 'static>>> {
 
         let tracker_url = self.build_tracker_url(&PEER_ID, 8080);
         // announce our presence to the tracker, TODO: don't use unwrap here
@@ -329,18 +369,48 @@ impl Torrent {
             let x = &response.peers[i..i + 6];
             let (&ip, port) = x.split_array_ref::<4>();
             let s = SocketAddr::new(IpAddr::from(ip), BigEndian::read_u16(port));
-            let info_hash = self.info_hash.clone();
-            tokio::net::TcpStream::connect(s)
-                .and_then(move |peer| async move { 
-                    Torrent::handshake(&info_hash, peer, None).await
-                        .map_err(|_err| std::io::Error::new(std::io::ErrorKind::Other, "handshake failed"))
-                }).boxed_local()
+            tokio::net::TcpStream::connect(s).boxed_local()
         })
             .collect::<futures::stream::FuturesUnordered<_>>()
     }
 
+    pub fn handshake_stream<'a, A: AsyncWrite + AsyncRead + Unpin + Debug + 'a>(
+        self,
+        potential_peers: impl futures::stream::Stream<Item = IoResult<A>> + Unpin + 'a,
+    ) -> (impl futures::stream::Stream<Item = (PeerState, A)> + Unpin + 'a) {
+
+        let mut connected_peers = FuturesUnordered::new();
+        let mut potential_peers = potential_peers.fuse();
+
+        async_stream::stream! {
+            loop {
+                tokio::select! {
+                    res = potential_peers.next() => {
+                        match res {
+                            Some(Ok(peer)) => {
+                                let b = self.metadata.borrow();
+                                let metadata_size = b.as_ref().map(|x| serde_bencode::to_bytes(x).unwrap().len() as u32);
+                                drop(b);
+                                let handshake = Torrent::handshake(self.info_hash, peer, metadata_size);
+                                connected_peers.push(handshake);
+                            }
+                            Some(Err(err)) => info!("failed to connect to peer with error: {:?}", err),
+                            None => { break; }
+                        }
+                    }
+                    Some(res) = connected_peers.next() => {
+                        match res {
+                            Ok(peer) => yield peer,
+                            Err(err) => info!("failed to handshake peer with error: {:?}", err)
+                        }
+                    }
+                }
+            };
+        }.boxed_local()
+    }
+
     pub async fn handshake<A: AsyncWrite + AsyncRead + Unpin + Debug>(
-        info_hash: &[u8; 20],
+        info_hash: [u8; 20],
         mut peer: A,
         metadata_size: Option<u32>,
     ) -> Result<(PeerState, A), Box<dyn std::error::Error>> {
@@ -348,7 +418,7 @@ impl Torrent {
             len: 19,
             protocol: b"BitTorrent protocol".to_owned(),
             reserved: [0, 0, 0, 0, 0, 0x10, 0, 0],
-            info_hash: *info_hash,
+            info_hash: info_hash,
             peer_id: *PEER_ID,
         };
 
@@ -358,7 +428,7 @@ impl Torrent {
         let res: Handshake = bincode::deserialize(&bytes)?;
 
         // verify info hash
-        if res.info_hash != *info_hash {
+        if res.info_hash != info_hash {
             panic!("invalid infohash")
         }
 
@@ -394,7 +464,7 @@ impl Torrent {
 
     pub async fn download_metadata<A: AsyncWrite + AsyncRead + Unpin + Debug + 'static>(
         &self,
-        potential_peers: &mut (impl futures::stream::Stream<Item = IoResult<(PeerState, A)>> + Unpin),
+        potential_peers: &mut (impl futures::stream::Stream<Item = (PeerState, A)> + Unpin),
         connected_peers: &mut Vec<Rc<RefCell<(PeerState, A)>>>,
     ) -> Vec<u8> {
         let (result_tx, mut result_rx) = tokio::sync::mpsc::channel(1);
@@ -447,14 +517,15 @@ impl Torrent {
     }
 
     pub async fn enqueue_pieces(&self, file: Option<Box<dyn AsyncRead + Unpin>>) -> (crossbeam_channel::Sender<PieceWork>, crossbeam_channel::Receiver<PieceWork>) {
-        let torrent: &BencodeInfo = self.metadata.as_ref().expect("Unable to enqueue pieces without metadata");
+        let b = self.metadata.borrow();
+        let torrent: &BencodeInfo = b.as_ref().expect("Unable to enqueue pieces without metadata");
         let pieces: &[[u8; 20]] = torrent.pieces.as_chunks().0;
         let (piece_tx, piece_rx) = crossbeam_channel::bounded(pieces.len());
 
         let mut file_pieces = Vec::new();
         let mut file_pieces = if let Some(mut file) = file {
             file.read_to_end(&mut file_pieces).await.unwrap();
-            Some(file_pieces.chunks(self.metadata.as_ref().unwrap().piece_len as usize))
+            Some(file_pieces.chunks(self.metadata.borrow().as_ref().unwrap().piece_len as usize))
         } else {
             None
         };
@@ -481,7 +552,7 @@ impl Torrent {
 
     pub async fn download_pieces<A: AsyncWrite + AsyncRead + Unpin + Debug + 'static, F: AsyncWrite + AsyncSeek + Unpin>(
         &self,
-        potential_peers: &mut (impl futures::stream::Stream<Item = IoResult<(PeerState, A)>> + Unpin),
+        potential_peers: &mut (impl futures::stream::Stream<Item = (PeerState, A)> + Unpin),
         connected_peers: &mut Vec<Rc<RefCell<(PeerState, A)>>>,
         file: &mut F,
         piece_queue: (crossbeam_channel::Sender<PieceWork>, crossbeam_channel::Receiver<PieceWork>)
@@ -508,6 +579,7 @@ impl Torrent {
                         continue;
                     }
 
+                    debug!("attempting to download piece {:?} from peer {:?} with state {:?}", pw, peer, state);
                     let buf = match attempt_download_piece(peer, state, &pw).await {
                         Ok(buf) => buf,
                         Err(error) => {
@@ -515,7 +587,7 @@ impl Torrent {
                             return Err(error)
                         }
                     };
-
+                    
                     // check integrity of the piece
                     let hash: [u8; 20] = Sha1::digest(&buf).into();
                     if hash != pw.hash {
@@ -535,7 +607,7 @@ impl Torrent {
             }.boxed_local()
         };
 
-        let piece_len = self.metadata.as_ref().unwrap().piece_len;
+        let piece_len = self.metadata.borrow().as_ref().unwrap().piece_len;
 
         let result_fun = async {
             let mut downloaded_pieces = 0;
@@ -566,7 +638,7 @@ impl Torrent {
 
     async fn start<R, A: AsyncWrite + AsyncRead + Unpin + Debug>(
         &self, 
-        potential_peers: &mut (impl futures::stream::Stream<Item = IoResult<(PeerState, A)>> + Unpin),
+        potential_peers: &mut (impl futures::stream::Stream<Item = (PeerState, A)> + Unpin),
         connected_peers: &mut Vec<Rc<RefCell<(PeerState, A)>>>,
         work_fun: impl Fn(Rc<RefCell<(PeerState, A)>>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>>>>,
         result_fun: impl Future<Output = R>
@@ -585,18 +657,16 @@ impl Torrent {
         loop {
             info!("active peers: {}", in_progress.len());
             tokio::select! {
-                Some(res) = potential_peers.next() => {
-                    if let Ok(peer) = res {
-                        let peer = Rc::new(RefCell::new(peer));
-                        connected_peers.push(peer.clone());
-
-                        in_progress.push(work_fun(peer));
-                    } else {
-                        info!("disconnecting from peer with error: {:?}", res)
-                    }
+                Some(peer) = potential_peers.next() => {
+                    let peer = Rc::new(RefCell::new(peer));
+                    connected_peers.push(peer.clone());
+                    in_progress.push(work_fun(peer));
                 }
-                Some(Err(err)) = in_progress.next() => {
-                    error!("disconnecting from peer with error: {:?}", err)
+                Some(m) = in_progress.next() => {
+                    match m {
+                        Err(err) => error!("disconnected from peer with error: {:?}", err),
+                        Ok(_) => info!("disconnected from peer successfully")
+                    }
                 }
                 result = &mut result_fun => {
                     in_progress.clear();
@@ -617,6 +687,8 @@ impl Torrent {
         bitfield: &BitVec,
         metadata: Vec<u8>
     ) -> Result<(), Box<dyn Error>>{
+        debug!("starting seed to peer {:?}", peer);
+
         send_message(peer, opcode::BITFIELD, Some(bitfield.to_bytes())).await?;
         send_message(peer, opcode::UNCHOKE, None).await?;
 
@@ -645,6 +717,8 @@ impl Torrent {
                 .with_big_endian()
                 .with_fixint_encoding()
                 .deserialize(&msg.payload)?;
+
+            debug!("seeder received new piece request: {:?}", pr);
             
             let begin = (pr.index * piece_len as u32) + pr.requested;
             let mut buf = vec![0u8; pr.len as usize];
@@ -663,27 +737,26 @@ impl Torrent {
 
     pub async fn seed_pieces<A: AsyncWrite + AsyncRead + Unpin + Debug, F: AsyncRead + AsyncSeek + Unpin>(
         &self, 
-        peers: &mut (impl futures::stream::Stream<Item = IoResult<(PeerState, A)>> + Unpin),
+        peers: &mut (impl futures::stream::Stream<Item = (PeerState, A)> + Unpin),
         file: F
     ) {
         let mut in_progress: FuturesUnordered<Pin<Box<dyn Future<Output = _>>>> = FuturesUnordered::new();
-        let piece_len = self.metadata.as_ref().unwrap().piece_len;
+        let piece_len = self.metadata.borrow().as_ref().unwrap().piece_len;
         let file = Rc::new(Mutex::new(file));
 
-        let metadata = serde_bencode::to_bytes(&self.metadata).unwrap();
+        let metadata = serde_bencode::to_bytes(&*self.metadata).unwrap();
+
+        // TODO: use start instead
+        // self.start(potential_peers, connected_peers, fun, result_fun).await;
 
         loop {
             tokio::select! {
-                Some(res) = peers.next() => {
-                    if let Ok((mut state, mut peer)) = res {
-                        let file = file.clone();
-                        let metadata = metadata.clone();
-                        in_progress.push(async move {
-                            Torrent::_seed_pieces(&mut state, &mut peer, file, piece_len, &self.bitfield, metadata).await
-                        }.boxed_local())
-                    } else {
-                        info!("disconnecting from peer with error: {:?}", res);
-                    }
+                Some((mut state, mut peer)) = peers.next() => {
+                    let file = file.clone();
+                    let metadata = metadata.clone();
+                    in_progress.push(async move {
+                        Torrent::_seed_pieces(&mut state, &mut peer, file, piece_len, &self.bitfield, metadata).await
+                    }.boxed_local())
                 }
                 Some(_) = in_progress.next() => {}
                 else => {
@@ -768,6 +841,28 @@ mod opcode {
     pub const EXTENDED: u8 = 20;
 }
 
+trait OpcodeName {
+    fn to_opcode_name(&self) -> &'static str;
+}
+
+impl OpcodeName for u8 {
+    fn to_opcode_name(&self) -> &'static str {
+        match *self {
+            opcode::CHOKE => "CHOKE",
+            opcode::UNCHOKE => "UNCHOKE",
+            opcode::INTEREST => "INTEREST",
+            opcode::UNINTEREST => "UNINTEREST",
+            opcode::HAVE => "HAVE",
+            opcode::BITFIELD => "BITFIELD",
+            opcode::REQUEST => "REQUEST",
+            opcode::PIECE => "PIECE",
+            opcode::CANCEL => "CANCEL",
+            opcode::EXTENDED => "EXTENDED",
+            _ => panic!("Unknown opcode: {}", self),
+        }
+    }
+}
+
 impl Message {
     async fn serialize<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> IoResult<()>
     {
@@ -778,7 +873,7 @@ impl Message {
         Ok(())
     }
 
-    async fn read<R: AsyncRead + Unpin>(reader: &mut R, listen: &[u8], state: &mut PeerState) -> IoResult<Self>
+    async fn read<R: AsyncRead + Unpin + Debug>(reader: &mut R, listen: &[u8], state: &mut PeerState) -> IoResult<Self>
     {
         loop {
             let len = reader.read_u32().await?;
@@ -786,7 +881,7 @@ impl Message {
                 // keep-alive message
                 continue
             }
-
+            debug!("attempting to read message of size {:?} from peer {:?}", len, reader);
             let mut buf = vec![0u8; len as usize];
             reader.read_exact(&mut buf).await?;
             let (&id, payload) = buf.split_first().unwrap();
@@ -798,19 +893,21 @@ impl Message {
             }
             if listen.contains(&id) {
                 let msg = Message { id, payload: payload.to_vec() };
-                debug!("reading message: {:?}", msg);
+                debug!("reading message: {:?} from peer {:?}", msg, reader);
                 return Ok(msg)
+            } else {
+                debug!("ignoring {} message from {:?}", id.to_opcode_name(), reader);
             }
         }
     }
 }
 
-async fn send_message<W: AsyncWrite + Unpin>(peer: &mut W, id: u8, payload: Option<Vec<u8>>) -> IoResult<()> {
+async fn send_message<W: AsyncWrite + Unpin + Debug>(peer: &mut W, id: u8, payload: Option<Vec<u8>>) -> IoResult<()> {
     let msg = Message {
         id,
         payload: payload.unwrap_or_default()
     };
-    debug!("sending {:?}", msg);
+    debug!("sending {:?} to peer {:?}", msg, peer);
     msg.serialize(peer).await
 }
 
