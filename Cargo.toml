@@ -3,6 +3,9 @@ name = "wasmtorrent"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 serde_bencode = "^0.2.3"
 serde = "^1.0.0"
@@ -16,10 +19,11 @@ crossbeam-channel = "0.5.5"
 bit-vec = "0.6.3"
 percent-encoding = "2.1.0"
 log = "0.4"
+console_log = { version = "0.2", features = ["color"] }
 lazy_static = "1.4.0"
 
-futures = "0.3.21"
-tokio = { version = "1", features = ["io-util", "sync", "macros"] }
+futures = "0.3.31"
+tokio = { version = "1.40.0", features = ["io-util", "sync", "macros"] }
 
 hex = "0.4.3"
 
@@ -28,20 +32,24 @@ async-stream = "0.3.3"
 async-trait = "0.1.57"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.40.0", features = ["full"] }
 reqwest = { version = "0.11", features = ["blocking"] }
 tracing-subscriber = "0.3"
 tracing = "0.1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1.7"
 wasm-bindgen = "0.2"
-web-sys = { features = [
+web-sys = { version = "0.3.64", features = [
     "EventTarget",
     "RtcDataChannelEvent",
     "RtcDataChannel",
     "AddEventListenerOptions",
     "MessageEvent",
     "RtcDataChannelType",
+    "CustomEvent",
+    "CustomEventInit",
+    "MessageEventInit"
 ]}
 wasm-bindgen-futures = "0.4.32"
 js-sys = "0.3.59"
