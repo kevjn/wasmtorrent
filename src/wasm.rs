@@ -220,10 +220,22 @@ impl Torrent {
         }
     }
 
+    #[wasm_bindgen(static_method_of=Torrent)]
+    pub fn from_file(filename: String, file: Vec<u8>) -> Self {
+        Self {
+            inner: crate::Torrent::from_file(filename, file),
+        }
+    }
+
     pub fn from_metadata(metadata: Vec<u8>) -> Self {
         Self {
             inner: crate::Torrent::from_metadata(metadata),
         }
+    }
+
+    #[wasm_bindgen(method)]
+    pub fn build_magnet_link(&self) -> String {
+        self.inner.build_magnet_link()
     }
 
     #[wasm_bindgen(method)]
