@@ -1,0 +1,19 @@
+{
+    "main": "dist/index.js",
+    "scripts": {
+        "build": "npx webpack",
+        "serve": "npx webpack serve"
+    },
+    "dependencies": {
+        "lodash": "^4.17.21",
+        "wasmtorrent": "file:../../pkg"
+    },
+    "devDependencies": {
+        "@wasm-tool/wasm-pack-plugin": "1.5.0",
+        "html-webpack-plugin": "^5.3.2",
+        "text-encoding": "^0.7.0",
+        "webpack": "^5.49.0",
+        "webpack-cli": "^5.1.4",
+        "webpack-dev-server": "^3.11.2"
+    }
+}
