@@ -206,6 +206,56 @@ impl From<crate::ConnectionPool<DataStream>> for ConnectionPool {
     }
 }
 
+mod videostream {
+    use crate::wasm::Poll;
+
+    pub struct SourceBuffer(pub web_sys::SourceBuffer);
+
+    impl tokio::io::AsyncWrite for SourceBuffer {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            let arr_buf = js_sys::Uint8Array::from(buf).buffer();
+            if self.0.updating() {
+                log::warn!("not ready to append buffer!");
+                return Poll::Pending;
+            }
+            match self.0.append_buffer_with_array_buffer(&arr_buf) {
+                Ok(()) => {
+                    Poll::Ready(Ok(buf.len()))
+                }
+                Err(e) => {
+                    log::error!("failed to append with error {:?}", e);
+                    Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))
+                }
+            }
+        }
+
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncSeek for SourceBuffer {
+        fn start_seek(self: std::pin::Pin<&mut Self>, position: tokio::io::SeekFrom) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn poll_complete(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>
+        ) -> Poll<std::io::Result<u64>> {
+            Poll::Ready(Ok(0))
+        }
+    }
+}
+
 #[wasm_bindgen]
 struct Torrent {
     inner: crate::Torrent,
@@ -213,6 +263,14 @@ struct Torrent {
 
 #[wasm_bindgen]
 impl Torrent {
+    #[wasm_bindgen(getter)]
+    pub fn name(&self) -> Option<String> {
+        if let Some(info) = self.inner.metadata.borrow().as_ref() {
+            return Some(info.name.clone())
+        }
+        return None
+    }
+
     #[wasm_bindgen(static_method_of=Torrent)]
     pub fn from_magnet_link(magnet: &str) -> Self {
         Self {
@@ -273,6 +331,19 @@ impl Torrent {
             )
             .await;
         output.into_inner()
+    }
+
+    #[wasm_bindgen(method)]
+    pub async fn download_pieces_to_source_buf(&self, sink: &mut Sink, source_buf: &web_sys::SourceBuffer) {
+        let pieces = self.inner.enqueue_pieces(None).await;
+        self.inner
+            .download_pieces(
+                &mut sink.inner.incoming,
+                &mut sink.inner.connected,
+                &mut videostream::SourceBuffer(source_buf.clone()),
+                pieces,
+            )
+            .await;
     }
 
     #[wasm_bindgen(method)]
