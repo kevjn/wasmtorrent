@@ -1,0 +1,10 @@
+[package]
+name = "download-torrent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wasmtorrent = { path = '../../../'}
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = "0.3"
+tracing = "0.1"
